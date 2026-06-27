@@ -4,7 +4,7 @@
   "version": "0.1.0",
   "author": { "name": "RunCode", "url": "https://runcode.io" },
   "homepage": "https://runcode.io",
-  "repository": "https://github.com/runcode-io/claude-plugin",
+  "repository": "https://github.com/runcode-io/runcode-agent-plugin",
   "license": "MIT",
   "keywords": ["ssh", "remote-development", "runcode", "cde", "workspace", "agent"]
 }

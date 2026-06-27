@@ -1,0 +1,40 @@
+{
+  "name": "runcode",
+  "version": "0.1.0",
+  "description": "Secure SSH access from Codex into RunCode cloud development workspaces.",
+  "author": {
+    "name": "RunCode",
+    "url": "https://runcode.io"
+  },
+  "homepage": "https://runcode.io",
+  "repository": "https://github.com/runcode-io/runcode-agent-plugin",
+  "license": "MIT",
+  "keywords": [
+    "ssh",
+    "remote-development",
+    "runcode",
+    "cde",
+    "workspace",
+    "codex"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "RunCode",
+    "shortDescription": "Connect Codex to RunCode cloud workspaces over SSH.",
+    "longDescription": "RunCode gives Codex low-friction SSH access to your RunCode cloud development environments. It mints short-lived workspace-scoped credentials, pins the gateway host key, keeps SSH session material isolated, and can optionally write SSH config aliases for Codex App remote projects.",
+    "developerName": "RunCode",
+    "category": "Productivity",
+    "capabilities": [
+      "SSH",
+      "Remote Development",
+      "Port Forwarding"
+    ],
+    "websiteURL": "https://runcode.io",
+    "defaultPrompt": [
+      "Connect to my RunCode workspace",
+      "List my RunCode workspaces",
+      "Configure RunCode SSH hosts"
+    ],
+    "brandColor": "#0F766E"
+  }
+}

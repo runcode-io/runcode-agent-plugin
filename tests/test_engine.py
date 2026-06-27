@@ -54,7 +54,7 @@ def fake_api(method, path, token, base, body=None):
         calls["post"] += 1
         assert token == "dummy-token"
         assert body and body.get("public_key", "").startswith("ssh-ed25519 ")
-        assert body.get("client") == "claude-code"
+        assert body.get("client") == m.CLIENT
         exp = (datetime.now(timezone.utc) + timedelta(seconds=1800)).isoformat()
         return {
             "error": False,

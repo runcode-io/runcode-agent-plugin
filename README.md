@@ -24,12 +24,14 @@ certificates — only the server side changes, never this plugin.
 
 ```
 cde-plugin/
+├── .codex-plugin/
+│   └── plugin.json              # Codex plugin manifest (name: "runcode")
 ├── .claude-plugin/
 │   ├── plugin.json              # plugin manifest (name: "runcode")
 │   └── marketplace.json         # lets the dir double as a one-plugin marketplace
 ├── bin/runcode              # the engine — Python 3 stdlib, no deps (POSIX entry)
 ├── bin/runcode.cmd          # Windows entry point (launches the engine via Python)
-├── commands/                    # explicit slash commands (all under /runcode:…)
+├── commands/                    # Claude Code slash commands (all under /runcode:…)
 │   ├── connect.md               #   /runcode:connect [workspace] [command…]
 │   ├── stop.md                  #   /runcode:stop [workspace] (power the box down)
 │   ├── disconnect.md            #   /runcode:disconnect
@@ -37,14 +39,14 @@ cde-plugin/
 │   ├── login.md                 #   /runcode:login
 │   ├── doctor.md                #   /runcode:doctor (preflight a new machine/OS)
 │   └── statusline.md            #   /runcode:statusline (wire the workspace cue)
-├── skills/ssh/SKILL.md          # the /runcode:ssh skill (auto-activates from chat)
+├── skills/ssh/SKILL.md          # RunCode SSH skill for Claude Code and Codex
 └── README.md
 ```
 
-### Slash commands
+### Claude Code slash commands
 
-Plugin commands are always namespaced under the plugin name, so typing `/runcode` in the
-slash menu surfaces the whole family:
+In Claude Code, plugin commands are namespaced under the plugin name, so typing
+`/runcode` in the slash menu surfaces the whole family:
 
 | Command | Does |
 |---|---|
@@ -65,14 +67,67 @@ workspace") and the `ssh` skill activates on its own.
 
 ## Install
 
+### Codex
+
+This checkout now includes a Codex manifest at `.codex-plugin/plugin.json`.
+Codex plugins are installed from a marketplace entry. For local testing, point a
+repo or personal Codex marketplace at this directory as the plugin source:
+
+```json
+{
+  "name": "runcode-local",
+  "interface": {
+    "displayName": "RunCode Local"
+  },
+  "plugins": [
+    {
+      "name": "runcode",
+      "source": {
+        "source": "local",
+        "path": "./cde-plugin"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
+```
+
+Place that file at a marketplace root such as the parent repository's
+`.agents/plugins/marketplace.json`, adjusting `source.path` if the marketplace
+root differs. Then restart Codex, open `/plugins`, choose that marketplace, and
+install **RunCode**.
+
+Codex may not add plugin `bin/` directories to the shell `PATH`. If `runcode`
+is not found after installing the plugin, run the helper by absolute path once:
+
+```bash
+/path/to/cde-plugin/bin/runcode install-path
+```
+
+For Codex App remote projects, run:
+
+```bash
+runcode login
+runcode config-ssh
+```
+
+Then add the generated `runcode.<workspace>` host in Codex App Settings >
+Connections > SSH and open the remote project folder.
+
+### Claude Code
+
 Add the RunCode marketplace and install the plugin from inside Claude Code (one time):
 
 ```
-/plugin marketplace add runcode-io/claude-plugin
+/plugin marketplace add runcode-io/runcode-agent-plugin
 /plugin install runcode@runcode
 ```
 
-(Equivalently from a shell: `claude plugin marketplace add runcode-io/claude-plugin` then
+(Equivalently from a shell: `claude plugin marketplace add runcode-io/runcode-agent-plugin` then
 `claude plugin install runcode@runcode`.)
 
 The skill then loads as **`/runcode:ssh`**. Claude Code adds the plugin's `bin/` to the

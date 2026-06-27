@@ -55,7 +55,14 @@ DEFAULT_API_BASE = os.environ.get("RUNCODE_API_BASE", "https://app.runcode.io")
 DEFAULT_WEB_BASE = os.environ.get("RUNCODE_WEB_BASE", "https://runcode.io")
 API_PREFIX = "/api/rc"
 CLI_LOGIN_PATH = "/auth/cli-login/"
-CLIENT = "claude-code"
+CLIENT = os.environ.get("RUNCODE_CLIENT")
+if not CLIENT:
+    CLIENT = "codex" if any(os.environ.get(k) for k in (
+        "CODEX_HOME",
+        "CODEX_THREAD_ID",
+        "CODEX_MANAGED_PACKAGE_ROOT",
+        "CODEX_CI",
+    )) else "claude-code"
 DEFAULT_TTL = 1800
 # Where the project lives on the box (the repo is cloned here and the web IDE opens
 # it). `exec`/`run` cd here by default so the agent doesn't prefix every command with
