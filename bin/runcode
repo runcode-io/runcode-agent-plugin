@@ -1,0 +1,2440 @@
+#!/usr/bin/env python3
+"""runcode -- mint a short-lived SSH session to a RunCode workspace.
+
+A coding agent (Claude Code / Codex / an editor) runs this LOCALLY. It:
+  1. generates an EPHEMERAL ed25519 keypair on this machine,
+  2. asks the RunCode backend for a connection bundle, sending ONLY the public
+     key (the private key never leaves this machine, never touches the server),
+  3. writes an isolated ssh config + a PINNED known_hosts so `ssh`/`git`/rsync
+     reach the workspace through the RunCode gateway with no TOFU yes/no prompt
+     and without touching the user's ~/.ssh.
+
+The one exception is the opt-in `config-ssh` command: it writes a clearly
+delimited, backed-up, removable managed block to ~/.ssh/config so the user's OWN
+editor/git (VS Code Remote, JetBrains, plain ssh) can reach the box too. Each
+host there proxies through `runcode proxy <id>`, which refreshes the
+short-lived key on every connect so the static config never goes stale.
+
+Today the backend registers the public key with the RunCode SSH gateway under a
+short TTL. The plugin is byte-for-byte identical for the future short-lived
+certificate model -- only the backend's credential minting changes.
+
+Stdlib only (urllib / subprocess / argparse). Python 3.8+.
+"""
+
+import argparse
+import base64
+import getpass
+import json
+import os
+import posixpath
+import re
+import secrets
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import webbrowser
+from datetime import datetime, timedelta, timezone
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
+DEFAULT_API_BASE = os.environ.get("RUNCODE_API_BASE", "https://app.runcode.io")
+# Where the user actually has a browser session (the consent page is rendered
+# here, session-authed). The DRF session cookie is host-only on the public site,
+# so this is the public web host, NOT the API host.
+DEFAULT_WEB_BASE = os.environ.get("RUNCODE_WEB_BASE", "https://runcode.io")
+API_PREFIX = "/api/rc"
+CLI_LOGIN_PATH = "/auth/cli-login/"
+CLIENT = "claude-code"
+DEFAULT_TTL = 1800
+# Where the project lives on the box (the repo is cloned here and the web IDE opens
+# it). `exec`/`run` cd here by default so the agent doesn't prefix every command with
+# `cd … &&`. The backend may override it per-workspace via the bundle's `workdir`;
+# this is only the fallback when an older control plane omits it.
+DEFAULT_WORKDIR = "/home/ubuntu/workspace"
+REUSE_MARGIN = 90  # re-mint if a cached session expires within this many seconds
+HTTP_TIMEOUT = 20
+# Readiness waits (--start brings a box to "running"; --wait blocks until SSH
+# actually answers). These are CEILINGS, not sleeps — they return the moment the
+# box is ready. POLL_INTERVAL paces the control-plane / SSH probes in between.
+DEFAULT_READY_TIMEOUT = 180
+POLL_INTERVAL = 3
+# Connection multiplexing: the first ssh opens a master socket; every later
+# `exec`/`run`/probe to the same box reuses it as a near-instant channel-open
+# instead of paying two fresh SSH handshakes through the gateway. The master
+# lingers this many seconds after the last client so a burst of agent commands
+# (with think-time between them) stays hot. POSIX only — Windows OpenSSH has no
+# ControlMaster. Capped well under the session TTL; a stale master just fails the
+# next command, which re-mints.
+CONTROL_PERSIST = 300
+
+# The engine runs on Windows, macOS, and Linux. _IS_WINDOWS gates the few seams
+# that genuinely differ (native config/cache dirs; how we hand off to ssh).
+_IS_WINDOWS = os.name == "nt"
+
+
+def _config_home():
+    """Per-user config dir. An explicit XDG_CONFIG_HOME always wins (what the
+    tests and power users rely on); otherwise %APPDATA% on Windows, ~/.config
+    elsewhere."""
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    if xdg:
+        return xdg
+    if _IS_WINDOWS:
+        return os.environ.get("APPDATA") or os.path.expanduser(r"~\AppData\Roaming")
+    return os.path.expanduser("~/.config")
+
+
+def _cache_home():
+    """Per-user cache dir. XDG_CACHE_HOME wins; else %LOCALAPPDATA% on Windows,
+    ~/.cache elsewhere."""
+    xdg = os.environ.get("XDG_CACHE_HOME")
+    if xdg:
+        return xdg
+    if _IS_WINDOWS:
+        return os.environ.get("LOCALAPPDATA") or os.path.expanduser(r"~\AppData\Local")
+    return os.path.expanduser("~/.cache")
+
+
+def _ssh_exe():
+    """Absolute path to the ssh client, or the bare name if it isn't on PATH (so
+    the FileNotFoundError handlers still produce the 'install OpenSSH' message).
+    Windows 10+ ships the OpenSSH client; which() finds ssh.exe."""
+    return shutil.which("ssh") or "ssh"
+
+
+def _sshkeygen_exe():
+    return shutil.which("ssh-keygen") or "ssh-keygen"
+
+
+def _python_exe():
+    return sys.executable or "python"
+
+
+CACHE_ROOT = os.path.join(_cache_home(), "runcode")
+
+
+# Set by the commands that emit machine-readable output (connect/list with
+# --json). When on, die() returns a parseable {"error","message"} object on
+# stdout instead of opaque prose on stderr, so a coding agent can branch on the
+# error_code deterministically rather than regex-matching English.
+_JSON_MODE = False
+
+
+def die(msg, code=1, error_code="error"):
+    msg = str(msg).rstrip()
+    if _JSON_MODE:
+        sys.stdout.write(json.dumps({"error": error_code, "message": msg}) + "\n")
+        try:
+            sys.stdout.flush()
+        except Exception:
+            pass
+    else:
+        sys.stderr.write("runcode: " + msg + "\n")
+    sys.exit(code)
+
+
+def _progress(msg):
+    """A reassurance line for a HUMAN watching a multi-second wait. ALWAYS goes to
+    stderr -- never stdout -- so it can't corrupt the JSON an agent parses there,
+    even when `--json` is set. Best-effort: a write failure must never break the
+    connect it is narrating."""
+    try:
+        sys.stderr.write("runcode: " + str(msg).rstrip() + "\n")
+        sys.stderr.flush()
+    except Exception:
+        pass
+
+
+# --------------------------------------------------------------------------- #
+# Auth + HTTP
+
+def _base_is_secure(url):
+    """True if `url` is safe to send the API token to: https anywhere, or http
+    only to loopback (so local dev against a plaintext server still works)."""
+    try:
+        parts = urllib.parse.urlparse(url or "")
+    except (ValueError, AttributeError):
+        return False
+    scheme = (parts.scheme or "").lower()
+    host = (parts.hostname or "") or ""
+    if scheme == "https":
+        return True
+    return scheme == "http" and (host in ("localhost", "::1") or host.startswith("127."))
+
+
+def _require_secure_base(url, what="endpoint"):
+    """Refuse to talk to a non-HTTPS control plane. The API token rides in an
+    Authorization header and the bundle we get back STEERS ssh, so cleartext is a
+    token-sniff + connection-hijack vector."""
+    if _base_is_secure(url):
+        return
+    die("refusing an insecure %s %r -- RunCode requires https:// (http is allowed "
+        "only for loopback). Point it at an https URL." % (what, url),
+        code=2, error_code="insecure_base")
+
+
+class _SecureRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urllib follows redirects and carries the Authorization header along, so a
+    compromised/MITM'd https endpoint could 30x us to http://attacker and harvest
+    the API token. Re-apply the https-only gate to every redirect target."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        _require_secure_base(newurl, "redirect target")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+# Opener that verifies TLS (urllib default) AND refuses an insecure redirect hop.
+_OPENER = urllib.request.build_opener(_SecureRedirectHandler())
+
+
+def _token_path():
+    return os.path.join(_config_home(), "runcode", "token")
+
+
+def _save_token(token):
+    """Persist the API token to ~/.config/runcode/token (dir 0700, file 0600)."""
+    path = _token_path()
+    d = os.path.dirname(path)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(token.strip() + "\n")
+    os.chmod(path, 0o600)
+    return path
+
+
+def _load_token(cli_token):
+    if cli_token:
+        return cli_token.strip()
+    env = os.environ.get("RUNCODE_TOKEN")
+    if env:
+        return env.strip()
+    path = _token_path()
+    if os.path.isfile(path):
+        with open(path, "r", encoding="utf-8") as fh:
+            tok = fh.readline().strip()
+            if tok:
+                return tok
+    die(
+        "no RunCode API token found. Run `runcode login`, or set "
+        "RUNCODE_TOKEN, or write it to ~/.config/runcode/token (chmod 600).",
+        error_code="no_token",
+    )
+
+
+def _extract_error(raw):
+    try:
+        obj = json.loads(raw)
+    except ValueError:
+        return None
+    if isinstance(obj, dict):
+        m = obj.get("message") or obj.get("detail")
+        if m:
+            return m
+        if isinstance(obj.get("error"), str):
+            return obj["error"]
+    return None
+
+
+def _api(method, path, token, base, body=None):
+    _require_secure_base(base, "API base")
+    url = base.rstrip("/") + API_PREFIX + path
+    headers = {"Authorization": "Token " + token, "Accept": "application/json"}
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with _OPENER.open(req, timeout=HTTP_TIMEOUT) as resp:
+            raw = resp.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body_raw = ""
+        try:
+            body_raw = exc.read().decode("utf-8")
+        except Exception:
+            pass
+        msg = _extract_error(body_raw) or ("HTTP %d" % exc.code)
+        ecode = {
+            400: "bad_request", 401: "unauthorized", 403: "forbidden",
+            404: "not_found", 409: "conflict", 429: "rate_limited",
+            503: "unavailable",
+        }.get(exc.code, "http_error")
+        if exc.code == 503:
+            msg += " (the SSH feature may not be enabled on the server yet)"
+        elif exc.code == 401:
+            msg = "unauthorized -- check RUNCODE_TOKEN"
+        die("backend request failed: " + msg, code=2, error_code=ecode)
+    except urllib.error.URLError as exc:
+        die("cannot reach %s: %s" % (url, getattr(exc, "reason", exc)),
+            code=2, error_code="network")
+    try:
+        return json.loads(raw)
+    except ValueError:
+        die("backend returned a non-JSON response")
+
+
+def _verify_token(token, base):
+    """Best-effort: True if the token authenticates against the API."""
+    url = base.rstrip("/") + API_PREFIX + "/workspaces?category=active"
+    req = urllib.request.Request(
+        url, headers={"Authorization": "Token " + token, "Accept": "application/json"}
+    )
+    try:
+        with _OPENER.open(req, timeout=HTTP_TIMEOUT) as resp:
+            return 200 <= resp.status < 300
+    except Exception:
+        return False
+
+
+# --------------------------------------------------------------------------- #
+# Login -- browser-assisted token mint (loopback callback)
+
+def _callback_handler(result):
+    """One-shot HTTP handler that captures the ?state/token/email of /callback."""
+
+    class _H(BaseHTTPRequestHandler):
+        def log_message(self, *a):  # keep the terminal quiet
+            pass
+
+        def do_GET(self):
+            parsed = urllib.parse.urlparse(self.path)
+            if parsed.path != "/callback":
+                self.send_response(404)
+                self.end_headers()
+                return
+            q = urllib.parse.parse_qs(parsed.query)
+            result["state"] = (q.get("state") or [""])[0]
+            result["token"] = (q.get("token") or [""])[0]
+            result["email"] = (q.get("email") or [""])[0]
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            self.wfile.write(
+                b"<!doctype html><meta charset=utf-8><title>RunCode CLI</title>"
+                b"<body style='font-family:system-ui;max-width:32rem;margin:4rem "
+                b"auto;text-align:center;color:#0f172a'>"
+                b"<h2>&#10003; RunCode CLI login complete</h2>"
+                b"<p>You can close this tab and return to your terminal.</p></body>"
+            )
+
+    return _H
+
+
+def _do_browser_login(web_base, opener, timeout):
+    """Run the loopback exchange. `opener(url)` is handed the authorize URL
+    (prod: open a browser; tests: drive the callback). Returns (token, email)."""
+    _require_secure_base(web_base, "web base")
+    state = secrets.token_urlsafe(24)
+    result = {}
+    httpd = HTTPServer(("127.0.0.1", 0), _callback_handler(result))
+    try:
+        port = httpd.server_address[1]
+        url = "%s%s?%s" % (
+            web_base.rstrip("/"),
+            CLI_LOGIN_PATH,
+            urllib.parse.urlencode({"port": port, "state": state}),
+        )
+        opener(url)
+        httpd.timeout = 0.5
+        deadline = time.time() + timeout
+        while time.time() < deadline and "token" not in result:
+            httpd.handle_request()
+    finally:
+        httpd.server_close()
+    if "token" not in result:
+        die("login timed out after %ds -- no browser callback received." % timeout)
+    if result.get("state") != state:
+        die("state mismatch on callback -- aborting (possible cross-site request).")
+    token = (result.get("token") or "").strip()
+    if not token:
+        die("callback did not contain a token.")
+    return token, (result.get("email") or "").strip()
+
+
+def _fetch_workspaces(token, base, categories=("active", "shared")):
+    """Return a de-duplicated list of the caller's workspaces (normalized dicts).
+
+    Hits GET /api/rc/workspaces?category=<c> for each category and flattens the
+    `data.workspaces` arrays. A workspace can show up in more than one category
+    (owned *and* shared), so de-dupe by id keeping the first (owned) sighting.
+    Only the fields the plugin needs are kept; the API returns many more."""
+    out = {}
+    for category in categories:
+        resp = _api("GET", "/workspaces?category=" + category, token, base)
+        data = (resp or {}).get("data") or {}
+        for ws in data.get("workspaces", []) or []:
+            try:
+                wid = int(ws["id"])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if wid in out:
+                continue
+            state = str(
+                ws.get("interim_state") or ws.get("current_state") or ""
+            ).strip().lower()
+            out[wid] = {
+                "id": wid,
+                "title": str(ws.get("title") or "").strip(),
+                "custom_title": str(ws.get("custom_title") or "").strip(),
+                "provider": str(ws.get("provider") or "").strip().lower(),
+                "state": state,
+                "shared": category == "shared",
+            }
+    return [out[k] for k in sorted(out)]
+
+
+def _ssh_capable(ws):
+    """Whether this workspace's backend can be reached over SSH at all.
+
+    The list API surfaces the backend kind as the upstream `provider` field, and
+    SSH is served for only one of them. This predicate is the single place that
+    raw value is read — everything user-facing speaks only of "connectable", so
+    the plugin never leaks the underlying provider name to the user.
+    """
+    return ws.get("provider") == "aws"
+
+
+def _ws_connectable(ws):
+    """SSH-connectable right now: on an SSH-capable backend and currently running."""
+    return _ssh_capable(ws) and ws.get("state") == "running"
+
+
+def _resolve_workspace(ident, token, base):
+    """Return (ws_id:int, title:str|None). `ident` is a numeric id or a name.
+
+    Names are resolved against the caller's personal + shared workspaces, by
+    workspace title OR custom (display) title; team workspaces are not
+    name-resolved yet (pass the numeric id for those)."""
+    ident = (ident or "").strip()
+    if re.fullmatch(r"\d+", ident):
+        return int(ident), None
+    needle = ident.lower()
+    matches = {}
+    for ws in _fetch_workspaces(token, base):
+        if needle and needle in (ws["title"].lower(), ws["custom_title"].lower()):
+            matches[ws["id"]] = ws["title"]
+    if not matches:
+        die(
+            "no workspace named %r found among your personal/shared workspaces. "
+            "Run `runcode list` to see them, or pass the numeric id." % ident
+        )
+    if len(matches) > 1:
+        die(
+            "workspace name %r is ambiguous (ids: %s); pass the numeric id."
+            % (ident, ", ".join(str(i) for i in sorted(matches)))
+        )
+    wid = next(iter(matches))
+    return wid, matches[wid]
+
+
+# --------------------------------------------------------------------------- #
+# Readiness: start a stopped workspace, wait for it to run + answer SSH
+
+def _workspace_state(ws_id, token, base):
+    """The control-plane state of one workspace ('running'/'stopped'/...), or ''
+    if it isn't among the caller's personal/shared workspaces (e.g. a team box
+    addressed by id)."""
+    for ws in _fetch_workspaces(token, base):
+        if ws["id"] == ws_id:
+            return ws.get("state") or ""
+    return ""
+
+
+def _start_workspace(ws_id, token, base):
+    """Ask the backend to start a stopped workspace. Idempotent on the server
+    (starting an already-running box is a harmless no-op). Dies with the backend
+    message on refusal (insufficient balance, not authorized, banned, ...)."""
+    resp = _api("GET", "/workspace/start?workspace_id=%d" % ws_id, token, base)
+    if resp.get("error"):
+        die("could not start workspace #%d: %s"
+            % (ws_id, resp.get("message") or "unknown error"),
+            code=2, error_code="start_failed")
+    return resp
+
+
+def _stop_workspace(ws_id, token, base):
+    """Ask the backend to stop a running workspace (the VM powers down; compute
+    billing pauses, storage persists). Idempotent on the server (stopping an
+    already-stopped box is a harmless no-op). Dies with the backend message on
+    refusal (not authorized, banned)."""
+    resp = _api("GET", "/workspace/stop?workspace_id=%d" % ws_id, token, base)
+    if resp.get("error"):
+        die("could not stop workspace #%d: %s"
+            % (ws_id, resp.get("message") or "unknown error"),
+            code=2, error_code="stop_failed")
+    return resp
+
+
+def _wait_for_running(ws_id, token, base, timeout, on_wait=None):
+    """Poll the control plane until the workspace reports 'running'. Returns True
+    once running, False if it never does within `timeout` seconds. `on_wait(elapsed)`
+    is invoked once per poll (before sleeping) so a long wait can show progress."""
+    deadline = time.time() + timeout
+    started = time.time()
+    while True:
+        if _workspace_state(ws_id, token, base) == "running":
+            return True
+        if time.time() >= deadline:
+            return False
+        if on_wait:
+            on_wait(int(time.time() - started))
+        time.sleep(POLL_INTERVAL)
+
+
+def _ssh_reachable_once(meta):
+    """True if a no-op SSH command to the workspace succeeds right now. A box can
+    be 'running' on the control plane ~30s before sshd/gateway routing answers,
+    so this probes the real data path."""
+    argv = [_ssh_exe(), "-F", meta["config"],
+            "-o", "ConnectTimeout=8", "-o", "BatchMode=yes",
+            meta["alias"], "true"]
+    try:
+        r = subprocess.run(
+            argv, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=15
+        )
+        return r.returncode == 0
+    except (FileNotFoundError, subprocess.SubprocessError, OSError):
+        return False
+
+
+def _wait_for_ssh(meta, timeout, on_wait=None):
+    """Block until the workspace actually answers SSH. Returns True once reachable,
+    False if it never answers within `timeout` seconds. `on_wait(elapsed)` fires once
+    per poll (before sleeping) so a long wait can show progress."""
+    deadline = time.time() + timeout
+    started = time.time()
+    while True:
+        if _ssh_reachable_once(meta):
+            return True
+        if time.time() >= deadline:
+            return False
+        if on_wait:
+            on_wait(int(time.time() - started))
+        time.sleep(POLL_INTERVAL)
+
+
+# --------------------------------------------------------------------------- #
+# Session materialization
+
+def _ws_cache_dir(ws_id):
+    return os.path.join(CACHE_ROOT, "ws-%d" % ws_id)
+
+
+def _read_meta(d):
+    try:
+        with open(os.path.join(d, "meta.json"), "r", encoding="utf-8") as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return None
+
+
+def _parse_expiry(s):
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
+def _session_valid(meta, d):
+    if not meta:
+        return False
+    exp = _parse_expiry(meta.get("expires_at"))
+    if not exp or exp - datetime.now(timezone.utc) <= timedelta(seconds=REUSE_MARGIN):
+        return False
+    return all(
+        os.path.isfile(os.path.join(d, f))
+        for f in ("id_ed25519", "known_hosts", "config")
+    )
+
+
+def _genkey(d):
+    keypath = os.path.join(d, "id_ed25519")
+    for p in (keypath, keypath + ".pub"):
+        try:
+            os.remove(p)
+        except OSError:
+            pass
+    try:
+        subprocess.run(
+            [_sshkeygen_exe(), "-t", "ed25519", "-N", "", "-q",
+             "-C", "runcode-agent", "-f", keypath],
+            check=True, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        die("ssh-keygen not found -- install the OpenSSH client.")
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or b"").decode("utf-8", "replace").strip()
+        die("ssh-keygen failed: " + (detail or "unknown error"))
+    os.chmod(keypath, 0o600)
+    with open(keypath + ".pub", "r", encoding="utf-8") as fh:
+        return keypath, fh.read().strip()
+
+
+# ssh_config keywords that can execute an arbitrary LOCAL command. A legitimate
+# RunCode bundle only sets Host/HostName/Port/User (+ the Strict/IdentitiesOnly
+# hardening, which we also assert ourselves), so none of these ever belong in it.
+_DANGEROUS_SSH_DIRECTIVES = frozenset({
+    "proxycommand", "localcommand", "permitlocalcommand", "knownhostscommand",
+    # `Include` parses another file AS ssh_config; aimed at an attacker-readable
+    # path (e.g. the session known_hosts) it can smuggle a ProxyCommand past a
+    # per-directive scan. We never emit Include ourselves, so a bundle that does
+    # is hostile. (Belt-and-suspenders: _materialize no longer feeds the bundle's
+    # ssh_config to ssh at all -- it builds the Host stanza locally.)
+    "include",
+})
+
+
+def _assert_safe_ssh_config(cfg):
+    """Refuse a server-supplied ssh_config that could run a LOCAL command.
+
+    The bundle's ssh_config arrives over TLS from the control plane and is fed to
+    `ssh -F`, so any directive that shells out (ProxyCommand, LocalCommand,
+    KnownHostsCommand, `Match exec ...`) would be client-side RCE if the control
+    plane were ever compromised or MITM'd. This is defense in depth ON TOP of the
+    https-only guard: even a fully trusted-looking response can't make us run code.
+    """
+    for raw in (cfg or "").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        # ssh treats "Key value" and "Key=value" the same, case-insensitively.
+        key = re.split(r"[\s=]+", line, maxsplit=1)[0].lower()
+        if key in _DANGEROUS_SSH_DIRECTIVES:
+            die("backend bundle's ssh_config contains a disallowed option %r -- "
+                "refusing to connect (possible compromised/MITM'd control plane)."
+                % key, code=2, error_code="unsafe_bundle")
+        if key == "match" and re.search(r"\bexec\b", line, re.IGNORECASE):
+            die("backend bundle's ssh_config contains a 'Match exec' directive -- "
+                "refusing to connect (possible compromised/MITM'd control plane).",
+                code=2, error_code="unsafe_bundle")
+
+
+# A workspace project dir gets interpolated into a remote `cd <dir> && …` shell
+# command (and into the `context` probe), so it must be a plain absolute path.
+# A bundle `workdir` that isn't one — a relative path, a `..` segment, spaces, or
+# any shell metacharacter — is treated as hostile/garbled (a compromised or MITM'd
+# control plane would otherwise get REMOTE shell injection on the box via this
+# field) and replaced with the documented default. Defense in depth alongside
+# _assert_safe_ssh_config, which guards the LOCAL shell the same way.
+_SAFE_WORKDIR = re.compile(r"^/[A-Za-z0-9._@+/-]+$")
+
+
+def _sanitize_workdir(wd):
+    wd = (wd or "").strip()
+    if wd and _SAFE_WORKDIR.match(wd) and ".." not in wd.split("/"):
+        return wd
+    return DEFAULT_WORKDIR
+
+
+# A bundle host is interpolated into `HostName <host>`, so restrict it to hostname
+# / IPv4 / IPv6 characters -- a value with a space or newline could otherwise break
+# out into another ssh directive (defense in depth: the bundle is attacker-
+# controllable under our threat model, a compromised/MITM'd control plane).
+_SAFE_HOSTNAME = re.compile(r"^[A-Za-z0-9._:-]+$")
+# A known_hosts line we will trust: `<hostpat> <keytype> <base64-blob>`.
+_SSH_KEYTYPE_RE = re.compile(r"^(ssh-[a-z0-9]+|ecdsa-[a-z0-9-]+|sk-[a-z0-9@.-]+)$",
+                             re.IGNORECASE)
+_KH_BLOB_RE = re.compile(r"^[A-Za-z0-9+/=]+$")
+
+
+def _session_known_hosts_content(raw):
+    """Keep only well-formed `<hostpat> <keytype> <base64>` lines from the bundle's
+    known_hosts, dropping everything else. The bundle is attacker-controllable and
+    this file lands at a predictable path, so refusing to write non-known_hosts
+    text means an `ssh -F` Include can never parse a smuggled ssh_config directive
+    (e.g. a ProxyCommand) out of it."""
+    out = []
+    for ln in (raw or "").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        parts = ln.split()
+        if (len(parts) >= 3 and _SSH_KEYTYPE_RE.match(parts[1])
+                and _KH_BLOB_RE.match(parts[2])):
+            out.append("%s %s %s" % (parts[0], parts[1], parts[2]))
+    return "\n".join(out) + ("\n" if out else "")
+
+
+def _materialize(d, bundle, keypath):
+    # Validate the three fields we interpolate into ssh_config. They come from the
+    # bundle, which is attacker-controllable under our threat model, so a value
+    # carrying a space/newline could otherwise break out into another directive.
+    user = str(bundle["user"])
+    host = str(bundle["host"])
+    if not _SAFE_HOST_TITLE.match(user):
+        die("backend bundle has an unsafe user %r -- refusing to connect "
+            "(possible compromised/MITM'd control plane)." % user,
+            code=2, error_code="unsafe_bundle")
+    if not _SAFE_HOSTNAME.match(host):
+        die("backend bundle has an unsafe host %r -- refusing to connect "
+            "(possible compromised/MITM'd control plane)." % host,
+            code=2, error_code="unsafe_bundle")
+    try:
+        port = int(bundle["port"])
+        if not (1 <= port <= 65535):
+            raise ValueError
+    except (TypeError, ValueError):
+        die("backend bundle has an unsafe port %r -- refusing to connect "
+            "(possible compromised/MITM'd control plane)." % (bundle.get("port"),),
+            code=2, error_code="unsafe_bundle")
+    alias = "runcode-" + user
+    kh = os.path.join(d, "known_hosts")
+    # NEVER write the bundle's known_hosts verbatim -- normalize to host-key lines
+    # only (see _session_known_hosts_content), so it can carry no executable text.
+    with open(kh, "w", encoding="utf-8") as fh:
+        fh.write(_session_known_hosts_content(bundle["known_hosts"]))
+    os.chmod(kh, 0o600)
+    cfgpath = os.path.join(d, "config")
+    # Build the Host stanza LOCALLY from the validated host/port/user rather than
+    # trusting the bundle's `ssh_config` string -- ssh then only ever parses
+    # directives WE wrote. A hostile/MITM'd bundle therefore cannot inject a
+    # ProxyCommand/Include, enable agent forwarding, or disable host-key checking:
+    # it's an allowlist by construction, not a denylist that must enumerate every
+    # dangerous keyword (and not a fragile first-value-wins append). `ssh -F` +
+    # IdentitiesOnly means the user's personal keys / ~/.ssh are never offered;
+    # GlobalKnownHostsFile is the OS null device so no global known_hosts
+    # participate; the local paths are quoted so a home dir with a space (common
+    # on Windows) survives parsing; BatchMode prevents a prompt hanging an agent.
+    block = (
+        "Host %s\n"
+        "  HostName %s\n"
+        "  Port %d\n"
+        "  User %s\n"
+        '  IdentityFile "%s"\n'
+        "  IdentitiesOnly yes\n"
+        '  UserKnownHostsFile "%s"\n'
+        "  GlobalKnownHostsFile %s\n"
+        "  StrictHostKeyChecking yes\n"
+        "  BatchMode yes\n"
+        % (alias, host, port, user, keypath, kh, os.devnull)
+    )
+    # Connection multiplexing (POSIX only): a per-workspace master socket inside
+    # this 0700 dir, so back-to-back `exec`s reuse one authenticated connection
+    # rather than re-handshaking through the gateway each time. Omitted on Windows,
+    # whose OpenSSH lacks ControlMaster and would error on these directives.
+    if not _IS_WINDOWS:
+        block += (
+            "  ControlMaster auto\n"
+            '  ControlPath "%s"\n'
+            "  ControlPersist %d\n" % (os.path.join(d, "cm"), CONTROL_PERSIST)
+        )
+    with open(cfgpath, "w", encoding="utf-8") as fh:
+        fh.write(block)
+    os.chmod(cfgpath, 0o600)
+    return alias, cfgpath
+
+
+def _ensure_session(ws_id, token, base, ttl, force):
+    """Return (meta, dir, minted_bool). Reuses a still-valid cached session."""
+    d = _ws_cache_dir(ws_id)
+    os.makedirs(d, mode=0o700, exist_ok=True)
+    try:
+        os.chmod(d, 0o700)
+    except OSError:
+        pass
+    meta = _read_meta(d)
+    if not force and _session_valid(meta, d):
+        return meta, d, False
+    keypath, pubkey = _genkey(d)
+    resp = _api(
+        "POST", "/workspace/%d/ssh-session" % ws_id, token, base,
+        body={"public_key": pubkey, "ttl": ttl, "client": CLIENT},
+    )
+    if resp.get("error"):
+        die("backend refused: " + (resp.get("message") or "unknown error"))
+    bundle = resp.get("bundle")
+    if not bundle:
+        die("backend response missing the connection bundle")
+    # Validate the fields we are about to index into / write to disk, so a
+    # malformed or partial backend response fails with a clear message instead
+    # of an opaque KeyError traceback further down.
+    missing = [
+        k for k in ("host", "port", "user", "known_hosts", "expires_at")
+        if bundle.get(k) in (None, "")
+    ]
+    if missing:
+        die("backend bundle is missing required field(s): " + ", ".join(missing))
+    # We build the ssh config locally (see _materialize), so the bundle's own
+    # ssh_config is no longer fed to ssh. Keep scanning it anyway as a loud
+    # tripwire: a bundle that ships ProxyCommand/Include/etc. signals a compromised
+    # or MITM'd control plane, so fail closed rather than connect.
+    _assert_safe_ssh_config(bundle.get("ssh_config"))
+    alias, cfgpath = _materialize(d, bundle, keypath)
+    meta = {
+        "ws_id": ws_id,
+        "alias": alias,
+        "config": cfgpath,
+        "host": bundle["host"],
+        "port": bundle["port"],
+        "user": bundle["user"],
+        # Token-less web address (display only; no ?tkn=). Absent on older
+        # backends — callers must treat it as optional.
+        "web_url": bundle.get("web_url", ""),
+        # The project dir to land `exec`/`run` in; backend-supplied (sanitized —
+        # it is interpolated into a remote shell), else the documented default.
+        # Stored so a reused cached session keeps the same cwd.
+        "workdir": _sanitize_workdir(bundle.get("workdir")),
+        "expires_at": bundle["expires_at"],
+    }
+    mpath = os.path.join(d, "meta.json")
+    with open(mpath, "w", encoding="utf-8") as fh:
+        json.dump(meta, fh)
+    os.chmod(mpath, 0o600)
+    return meta, d, True
+
+
+def _fmt_remaining(meta):
+    exp = _parse_expiry(meta.get("expires_at"))
+    if not exp:
+        return "unknown"
+    secs = int((exp - datetime.now(timezone.utc)).total_seconds())
+    if secs <= 0:
+        return "expired"
+    return "in ~%dm" % max(1, secs // 60)
+
+
+def _web_host(meta):
+    """The token-less web host of a workspace for display (no scheme, no secret)."""
+    url = (meta.get("web_url") or "").strip()
+    return url.split("://", 1)[-1].rstrip("/") if url else ""
+
+
+# --- "current" session pointer (which workspace the agent last connected to) #
+
+def _current_path():
+    return os.path.join(CACHE_ROOT, "current")
+
+
+def _set_current(ws_id, scope_dir=None):
+    """Record the workspace just connected to, so a status line can show it.
+
+    Line 1 is the ws id; line 2 is the directory the attach happened in (the cwd
+    of this `connect`/`exec`/`run` invocation, which runs inside the user's
+    Claude Code session). The status line uses that dir to show the segment ONLY
+    in the session/project that attached -- the pointer is one machine-global
+    file, so without this scope every Claude Code session on the box would light
+    up. Best-effort: a failure here must never break connect/run."""
+    try:
+        if scope_dir is None:
+            try:
+                scope_dir = os.path.realpath(os.getcwd())
+            except OSError:
+                scope_dir = ""
+        os.makedirs(CACHE_ROOT, mode=0o700, exist_ok=True)
+        fd = os.open(_current_path(), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            fh.write("%d\n%s\n" % (int(ws_id), scope_dir))
+    except (OSError, ValueError):
+        pass
+
+
+def _get_current():
+    try:
+        with open(_current_path(), "r", encoding="utf-8") as fh:
+            return int(fh.readline().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def _get_current_scope():
+    """The directory the attach happened in (line 2 of the pointer), or None for
+    a legacy single-line pointer written before dir-scoping existed -- in which
+    case the status line stays unscoped until the next connect re-records it."""
+    try:
+        with open(_current_path(), "r", encoding="utf-8") as fh:
+            fh.readline()  # ws id
+            scope = fh.readline().strip()
+            return scope or None
+    except OSError:
+        return None
+
+
+def _clear_current():
+    try:
+        os.remove(_current_path())
+    except OSError:
+        pass
+
+
+def _session_live(meta, d):
+    """A session usable right now: its files exist and it has not expired."""
+    exp = _parse_expiry(meta.get("expires_at"))
+    if not exp or exp <= datetime.now(timezone.utc):
+        return False
+    return os.path.isfile(os.path.join(d, "config"))
+
+
+def _current_session():
+    """Return the meta of the ATTACHED workspace (the `current` pointer), or None.
+
+    ONLY the explicitly-attached workspace counts — there is deliberately no
+    fallback to "some other live session". That keeps the sticky-attach model
+    honest: after `disconnect` (or `disconnect --keep`, which detaches but keeps
+    the cached material) the pointer is gone, so the status line goes dark even
+    when live session files for other workspaces still linger in the cache. This
+    mirrors `cmd_current`, which also reads only the pointer."""
+    cur = _get_current()
+    if cur is None:
+        return None
+    d = _ws_cache_dir(cur)
+    meta = _read_meta(d)
+    if meta and _session_live(meta, d):
+        return meta
+    return None
+
+
+# --------------------------------------------------------------------------- #
+# Commands
+
+def cmd_connect(args):
+    global _JSON_MODE
+    _JSON_MODE = bool(getattr(args, "json", False))
+    _require_secure_base(args.api_base, "API base")
+    token = _load_token(args.token)
+    ws_id, title = _resolve_workspace(args.workspace, token, args.api_base)
+    timeout = getattr(args, "timeout", None) or DEFAULT_READY_TIMEOUT
+
+    # --start: bring a stopped/unknown box up to running before minting (the
+    # mint endpoint 409s on a non-running box, so we must wait for it first).
+    started = False
+    if getattr(args, "start", False):
+        if _workspace_state(ws_id, token, args.api_base) != "running":
+            _progress("starting workspace #%d…" % ws_id)
+            _start_workspace(ws_id, token, args.api_base)
+            started = True
+            if not _wait_for_running(
+                ws_id, token, args.api_base, timeout,
+                on_wait=lambda s: _progress(
+                    "  …waiting for #%d to start (%ds)" % (ws_id, s)),
+            ):
+                die("workspace #%d did not reach 'running' within %ds -- it may "
+                    "still be starting; retry shortly." % (ws_id, timeout),
+                    code=2, error_code="not_ready")
+
+    # A box we just started may have had its short-lived gateway key reaped while
+    # stopped, so never reuse a stale cached session for it -- force a fresh mint.
+    meta, _, minted = _ensure_session(
+        ws_id, token, args.api_base, args.ttl, args.force or started
+    )
+    _set_current(ws_id)
+
+    # --wait: don't return until the data path actually answers (running != sshd
+    # reachable; the gateway/box can lag ~30s behind the control plane).
+    if getattr(args, "wait", False):
+        _progress("waiting for SSH on workspace #%d to answer…" % ws_id)
+        if not _wait_for_ssh(
+            meta, timeout,
+            on_wait=lambda s: _progress("  …waiting for SSH (%ds)" % s),
+        ):
+            die("workspace #%d is running but not reachable over SSH within %ds -- "
+                "it may still be booting; retry shortly." % (ws_id, timeout),
+                code=2, error_code="not_ready")
+
+    if args.json:
+        print(json.dumps({
+            "alias": meta["alias"],
+            "config": meta["config"],
+            "command": ["ssh", "-F", meta["config"], meta["alias"]],
+            "host": meta["host"],
+            "port": meta["port"],
+            "user": meta["user"],
+            "web_url": meta.get("web_url", ""),
+            # The project dir `exec`/`run` default into -- the agent should use this
+            # instead of hard-coding a path.
+            "workdir": meta.get("workdir", ""),
+            "expires_at": meta["expires_at"],
+            "started": started,
+            "reused": not minted,
+            # So the agent can OFFER to wire the always-on cue on first connect
+            # (the sticky session routes all work to the box; this is the signal).
+            "statusline_installed": _statusline_installed(),
+        }, indent=2))
+        return
+    # `title` is server-supplied (resolved from the list response) and the web
+    # host comes from the bundle -- both are attacker-controllable under the
+    # compromised/MITM'd-control-plane threat model, so sanitize before echoing
+    # (same terminal-escape guard the M1 work applies in list/context/current).
+    label = _safe_display(title) or meta["user"]
+    state = "ready" if minted else "reused (still valid)"
+    if started:
+        print("✓ started workspace #%d" % ws_id)
+    print("✓ SSH session %s for %s (ws #%d), expires %s"
+          % (state, label, ws_id, _fmt_remaining(meta)))
+    web_host = _safe_display(_web_host(meta))
+    if web_host:
+        print("  workspace: %s" % web_host)
+    print("  this workspace is now attached — run work on it with:")
+    print("    runcode exec -- <command>          # e.g. exec -- 'cd /home/ubuntu/workspace && pytest -q'")
+    print("    runcode disconnect                 # when done (work reverts to local)")
+    print("  (low-level: ssh -F %s %s [-- <cmd>])" % (meta["config"], meta["alias"]))
+
+
+def cmd_stop(args):
+    """Stop a workspace on the control plane: the VM powers down, compute billing
+    pauses (storage persists), and `connect --start` boots it again later. Targets
+    the named workspace, or the ATTACHED one when no name is given.
+
+    Run this ONLY on the user's explicit request -- never to "tidy up" after a
+    task. Stopping the attached box ends the working session (a stopped box can't
+    serve `exec`, since the mint endpoint 409s on a non-running box), so it
+    detaches: the sticky pointer is cleared and the cached session dropped unless
+    --keep. That is the requested consequence of stopping, not the agent
+    disconnecting on its own initiative."""
+    global _JSON_MODE
+    _JSON_MODE = bool(getattr(args, "json", False))
+    _require_secure_base(args.api_base, "API base")
+    token = _load_token(args.token)
+
+    ident = getattr(args, "workspace", None)
+    if ident:
+        ws_id, title = _resolve_workspace(ident, token, args.api_base)
+    else:
+        ws_id = _get_current()
+        if ws_id is None:
+            die("no workspace given and none attached -- run "
+                "`runcode stop <workspace>` or connect first.",
+                error_code="not_found")
+        title = None
+
+    _stop_workspace(ws_id, token, args.api_base)
+
+    detached = False
+    if _get_current() == ws_id:
+        _clear_current()
+        detached = True
+        if not getattr(args, "keep", False):
+            d = _ws_cache_dir(ws_id)
+            _close_master(d)
+            if os.path.isdir(d):
+                _rmtree(d)
+
+    if getattr(args, "json", False):
+        print(json.dumps(
+            {"stopped": True, "workspace_id": ws_id, "detached": detached},
+            indent=2))
+        return
+    # `title` is server-supplied -- sanitize before echoing (see cmd_connect).
+    label = _safe_display(title) or ("ws #%d" % ws_id)
+    print("✓ stopped %s (ws #%d) -- compute billing paused; storage persists."
+          % (label, ws_id))
+    if detached:
+        print("  detached -- work reverts to local; `connect --start` to resume.")
+
+
+def _with_workdir(meta, remote_cmd, home):
+    """Default the remote working dir to the session's project dir, so the agent
+    doesn't have to prefix every command with `cd <workdir> &&`.
+
+    ssh joins the post-host argv with spaces and runs the result through the remote
+    login shell, so a leading `cd <dir> &&` composes correctly with whatever the
+    caller passed. Untouched when `home` is set (land in $HOME), when there is no
+    command (an interactive shell), or when the session has no workdir (a legacy
+    cached session minted before this field existed)."""
+    if home or not remote_cmd:
+        return remote_cmd
+    workdir = (meta.get("workdir") or "").strip()
+    if not workdir:
+        return remote_cmd
+    return ["cd", workdir, "&&"] + list(remote_cmd)
+
+
+def _exec_ssh(meta, remote_cmd, home=False, remint=None):
+    """Run a command on the workspace over the session.
+
+    An EMPTY command opens an interactive shell — hand the tty straight to ssh
+    (os.execvp on POSIX; a child on Windows, where execvp breaks the console and
+    the parent shell returns early). A non-empty command is a BATCH run: execute
+    it as a child so we can SEE the exit code, and on an ssh TRANSPORT failure
+    (exit 255 — the connection dropped or the gateway reaped the session) re-mint
+    once via `remint()` and retry, so the agent never has to hand-roll session
+    recovery. The remote command's OWN exit code is propagated verbatim; only 255
+    triggers a retry, because ssh overloads it for transport errors."""
+    remote_cmd = _with_workdir(meta, remote_cmd, home)
+    sys.stdout.flush()
+    sys.stderr.flush()
+
+    def _argv(m):
+        a = [_ssh_exe(), "-F", m["config"], m["alias"]]
+        if remote_cmd:
+            a += remote_cmd
+        return a
+
+    # Interactive shell: no capture, no retry — the user is driving the tty.
+    if not remote_cmd:
+        argv = _argv(meta)
+        if _IS_WINDOWS:
+            try:
+                sys.exit(subprocess.call(argv))
+            except FileNotFoundError:
+                die("ssh not found -- install the OpenSSH client.")
+        try:
+            os.execvp(argv[0], argv)
+        except FileNotFoundError:
+            die("ssh not found -- install the OpenSSH client.")
+        return
+
+    # Batch command: observe the exit code; re-mint + retry ONCE on a 255.
+    try:
+        rc = subprocess.call(_argv(meta))
+    except FileNotFoundError:
+        die("ssh not found -- install the OpenSSH client.")
+    if rc == 255 and remint is not None:
+        _progress("session dropped (ssh 255) — re-minting and retrying once…")
+        fresh = remint()
+        if fresh:
+            try:
+                rc = subprocess.call(_argv(fresh))
+            except FileNotFoundError:
+                die("ssh not found -- install the OpenSSH client.")
+    sys.exit(rc)
+
+
+def _ssh_capture(meta, remote_cmd, input_text=None, timeout=60):
+    """Run a remote command over the session and CAPTURE its output — unlike
+    _exec_ssh, which hands stdio straight through. Reuses the multiplexed master,
+    so this is cheap after the first connect. Returns (returncode, stdout_bytes,
+    stderr_bytes). `input_text` (str or bytes) is fed to the remote command's
+    stdin (used to pipe a probe script or a base64 file body without any quoting
+    hazard). Does NOT inject the workdir `cd` — callers control the remote cwd."""
+    argv = [_ssh_exe(), "-F", meta["config"], meta["alias"]] + list(remote_cmd)
+    data = input_text.encode("utf-8") if isinstance(input_text, str) else input_text
+    try:
+        p = subprocess.run(argv, input=data, stdout=subprocess.PIPE,
+                           stderr=subprocess.PIPE, timeout=timeout)
+    except FileNotFoundError:
+        die("ssh not found -- install the OpenSSH client.")
+    return p.returncode, p.stdout, p.stderr
+
+
+def _context_script(workdir):
+    """A small POSIX-sh probe that prints a flat, tab/`=`-delimited digest of the
+    workspace in ONE round trip. `workdir` is already sanitized (safe charset), so
+    single-quoting it here is injection-safe. Every probe is best-effort — a
+    missing tool or non-repo dir just omits its line."""
+    wd = workdir or DEFAULT_WORKDIR
+    return (
+        "cd '%s' 2>/dev/null || cd \"$HOME\" 2>/dev/null || true\n" % wd +
+        "printf 'cwd=%s\\n' \"$(pwd)\"\n"
+        "printf 'os=%s\\n' \"$(uname -s 2>/dev/null)\"\n"
+        "printf 'arch=%s\\n' \"$(uname -m 2>/dev/null)\"\n"
+        "printf 'kernel=%s\\n' \"$(uname -r 2>/dev/null)\"\n"
+        "if [ -r /etc/os-release ]; then . /etc/os-release 2>/dev/null; "
+        "printf 'distro=%s\\n' \"$PRETTY_NAME\"; fi\n"
+        "if command -v git >/dev/null 2>&1 && "
+        "git rev-parse --is-inside-work-tree >/dev/null 2>&1; then\n"
+        "  printf 'git_branch=%s\\n' \"$(git rev-parse --abbrev-ref HEAD 2>/dev/null)\"\n"
+        "  if [ -n \"$(git status --porcelain 2>/dev/null)\" ]; then "
+        "printf 'git_dirty=yes\\n'; else printf 'git_dirty=no\\n'; fi\n"
+        "  printf 'git_remote=%s\\n' \"$(git config --get remote.origin.url 2>/dev/null)\"\n"
+        "  printf 'git_head=%s\\n' \"$(git log -1 --format=%h 2>/dev/null)\"\n"
+        "fi\n"
+        "for f in package.json pyproject.toml requirements.txt go.mod Cargo.toml "
+        "pom.xml build.gradle Gemfile composer.json Makefile Dockerfile "
+        "docker-compose.yml; do [ -e \"$f\" ] && printf 'marker=%s\\n' \"$f\"; done\n"
+        # `go` has no --version (it's `go version`); redirect every probe's stdin
+        # from /dev/null so a tool that reads stdin can't swallow the rest of this
+        # script (sh is reading it from the same pipe).
+        "for t in python3 node go rustc java ruby docker git pnpm npm make; do\n"
+        "  if command -v \"$t\" >/dev/null 2>&1; then\n"
+        "    if [ \"$t\" = go ]; then v=$(go version </dev/null 2>&1 | head -n1); "
+        "else v=$(\"$t\" --version </dev/null 2>&1 | head -n1); fi\n"
+        "    printf 'tool\\t%s\\t%s\\n' \"$t\" \"$v\"\n"
+        "  fi\n"
+        "done\n"
+        "printf 'disk=%s\\n' \"$(df -h . 2>/dev/null | "
+        "awk 'NR==2{print $4\" free / \"$2}')\"\n"
+    )
+
+
+def _parse_context(raw):
+    """Turn the probe's flat lines into a structured digest: scalars at the top
+    level, a nested `git` block, a `markers` list, and a name->version `tools` map."""
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "replace")
+    ctx = {"markers": [], "tools": {}}
+    git = {}
+    for line in raw.splitlines():
+        if line.startswith("tool\t"):
+            parts = line.split("\t")
+            if len(parts) >= 3 and parts[1]:
+                ctx["tools"][parts[1]] = parts[2].strip()
+            continue
+        if "=" not in line:
+            continue
+        key, _, val = line.partition("=")
+        val = val.strip()
+        if key == "marker":
+            if val:
+                ctx["markers"].append(val)
+        elif key.startswith("git_"):
+            git[key[4:]] = val
+        elif key:
+            ctx[key] = val
+    if git:
+        ctx["git"] = git
+    return ctx
+
+
+def cmd_context(args):
+    """Orient the agent on the workspace in ONE round trip: cwd, OS/arch, git
+    status, project markers, and key tool versions — so it doesn't probe the box
+    with a dozen separate `exec`s. Targets the named workspace, else the attached
+    one. `--json` for the structured digest, otherwise a short human summary."""
+    global _JSON_MODE
+    _JSON_MODE = bool(getattr(args, "json", False))
+    _require_secure_base(args.api_base, "API base")
+    token = _load_token(args.token)
+    ident = getattr(args, "workspace", None)
+    if ident:
+        ws_id, _ = _resolve_workspace(ident, token, args.api_base)
+    else:
+        ws_id = _get_current()
+        if ws_id is None:
+            die("no workspace given and none attached -- run "
+                "`runcode connect <workspace>` first, or pass a name.",
+                error_code="not_found")
+    meta, _, _ = _ensure_session(ws_id, token, args.api_base, args.ttl, args.force)
+    _set_current(ws_id)
+    rc, out, err = _ssh_capture(
+        meta, ["sh"], input_text=_context_script(meta.get("workdir")),
+        timeout=getattr(args, "timeout", None) or 30,
+    )
+    if rc != 0 and not (out or b"").strip():
+        detail = (err or b"").decode("utf-8", "replace").strip() or "no output"
+        die("could not gather workspace context (ssh exit %d): %s" % (rc, detail),
+            code=2, error_code="conflict")
+    ctx = _parse_context(out)
+    ctx["workspace_id"] = ws_id
+    ctx["workdir"] = meta.get("workdir", "")
+
+    if getattr(args, "json", False):
+        print(json.dumps(ctx, indent=2))
+        return
+    # Everything below is REMOTE-derived (the box's own `context` probe output), so
+    # a compromised/malicious workspace controls it -- run each field through
+    # _safe_display before echoing so it can't inject terminal escape sequences.
+    print("workspace #%d  %s" % (ws_id, _safe_display(ctx.get("workdir", ""))))
+    hostline = " ".join(_safe_display(x) for x in (ctx.get("distro") or ctx.get("os", ""),
+                                                   ctx.get("arch", "")) if x)
+    if hostline:
+        print("  host:    " + hostline)
+    g = ctx.get("git")
+    if g:
+        print("  git:     %s (%s)%s" % (
+            _safe_display(g.get("branch", "?")),
+            "dirty" if g.get("dirty") == "yes" else "clean",
+            ("  " + _safe_display(g["remote"])) if g.get("remote") else ""))
+    if ctx.get("markers"):
+        print("  project: " + ", ".join(_safe_display(x) for x in ctx["markers"]))
+    if ctx.get("tools"):
+        print("  tools:   " + ", ".join("%s %s" % (_safe_display(k), _safe_display(v))
+                                        for k, v in ctx["tools"].items()))
+    if ctx.get("disk"):
+        print("  disk:    " + _safe_display(ctx["disk"]))
+
+
+# --------------------------------------------------------------------------- #
+# Remote file primitives — a trustworthy Read/Write for the box.
+#
+# The skill otherwise drives edits through `cat > f <<EOF` / `sed -i` / `patch`,
+# which are fragile (an unquoted heredoc expands $VARs on the REMOTE shell, `cat >`
+# clobbers, diffs are error-prone). These move bytes base64-encoded over the
+# session, so any content survives with no quoting/interpolation hazard, and the
+# remote path is shell-quoted so spaces/metacharacters are safe too.
+
+def _shq(s):
+    """POSIX single-quote a string so the remote shell treats it as one literal
+    token (handles spaces, $, backticks, quotes — everything)."""
+    return "'" + str(s).replace("'", "'\\''") + "'"
+
+
+def _remote_path(meta, path):
+    """Resolve a remote path: absolute stays as-is; anything else is relative to
+    the session's project dir (the same default `exec` lands in)."""
+    path = (path or "").strip()
+    if not path:
+        die("no remote path given")
+    if path.startswith("/"):
+        return path
+    wd = (meta.get("workdir") or DEFAULT_WORKDIR).rstrip("/")
+    return wd + "/" + path
+
+
+def _remote_write(meta, remote_path, data):
+    """Write `data` (bytes) to `remote_path` on the box. base64 over stdin; creates
+    the parent dir. Returns the resolved absolute path."""
+    path = _remote_path(meta, remote_path)
+    parent = posixpath.dirname(path) or "/"
+    inner = "mkdir -p %s && base64 -d > %s" % (_shq(parent), _shq(path))
+    rc, _out, err = _ssh_capture(meta, [inner], input_text=base64.b64encode(data),
+                                 timeout=120)
+    if rc != 0:
+        detail = (err or b"").decode("utf-8", "replace").strip() or "unknown error"
+        die("remote write to %s failed (ssh exit %d): %s" % (path, rc, detail),
+            code=2, error_code="conflict")
+    return path
+
+
+def _remote_read(meta, remote_path):
+    """Read `remote_path` from the box and return its bytes (base64 over the wire)."""
+    path = _remote_path(meta, remote_path)
+    rc, out, err = _ssh_capture(meta, ["base64 %s" % _shq(path)], timeout=120)
+    if rc != 0:
+        detail = (err or b"").decode("utf-8", "replace").strip() or "unknown error"
+        die("remote read of %s failed (ssh exit %d): %s" % (path, rc, detail),
+            code=2, error_code="not_found")
+    try:
+        return base64.b64decode(out)
+    except (ValueError, TypeError):
+        die("remote file %s did not decode as base64" % path, code=2)
+
+
+def _attached_session(args):
+    """meta of the ATTACHED workspace (re-minting if the cached session lapsed),
+    or die. Shared entry point for the session-scoped primitives (write/get/put/
+    forward) — they operate on the sticky target, like `exec`."""
+    token = _load_token(args.token)
+    ws_id = _get_current()
+    if ws_id is None:
+        die("no attached workspace -- run `runcode connect <workspace>` first.",
+            error_code="not_found")
+    meta, _, _ = _ensure_session(ws_id, token, args.api_base, args.ttl,
+                                 getattr(args, "force", False))
+    _set_current(ws_id)
+    return meta
+
+
+def cmd_write(args):
+    """Write a file ON the attached workspace from local stdin (or --file <local>).
+    A relative path resolves against the project dir. Edit a file locally with your
+    native tools, then `write` it up — or pipe generated content straight in."""
+    if getattr(args, "file", None):
+        with open(args.file, "rb") as fh:
+            data = fh.read()
+    else:
+        data = sys.stdin.buffer.read()
+    meta = _attached_session(args)
+    path = _remote_write(meta, args.path, data)
+    print("wrote %d bytes to %s" % (len(data), path))
+
+
+def cmd_put(args):
+    """Upload a LOCAL file to the attached workspace (base64 over the session)."""
+    with open(args.local, "rb") as fh:
+        data = fh.read()
+    meta = _attached_session(args)
+    path = _remote_write(meta, args.remote, data)
+    print("uploaded %s -> %s (%d bytes)" % (args.local, path, len(data)))
+
+
+def cmd_get(args):
+    """Download a file FROM the attached workspace to a local path (or stdout)."""
+    meta = _attached_session(args)
+    data = _remote_read(meta, args.remote)
+    out = getattr(args, "out", None)
+    if out and out != "-":
+        with open(out, "wb") as fh:
+            fh.write(data)
+        print("downloaded %s -> %s (%d bytes)" % (args.remote, out, len(data)))
+    else:
+        sys.stdout.buffer.write(data)
+
+
+def cmd_forward(args):
+    """Expose a workspace port locally so a dev server on the box opens in your
+    browser. Adds the forward to the multiplexed master and RETURNS immediately
+    (no blocking tunnel process to babysit); `--cancel` removes it. Attached
+    workspace only. `forward 5173` maps local 5173 -> the box's localhost:5173;
+    override with `--local` / `--to`."""
+    remote_port = args.port
+    local_port = getattr(args, "local", None) or remote_port
+    host = (getattr(args, "to", None) or "localhost").strip()
+    spec = "%d:%s:%d" % (local_port, host, remote_port)
+    meta = _attached_session(args)
+    if _IS_WINDOWS:
+        # Windows OpenSSH has no ControlMaster, so there's no master to attach a
+        # forward to. Hand back the blocking command to run in a terminal.
+        die("port forwarding via the session master isn't available on Windows -- "
+            "run this in a terminal instead:\n  ssh -F %s -N -L %s %s"
+            % (meta["config"], spec, meta["alias"]),
+            code=2, error_code="unavailable")
+    # Make sure the master is up so the -O control op has something to talk to.
+    _ssh_reachable_once(meta)
+    action = "cancel" if getattr(args, "cancel", False) else "forward"
+    argv = [_ssh_exe(), "-F", meta["config"], "-O", action, "-L", spec, meta["alias"]]
+    try:
+        p = subprocess.run(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                           timeout=20)
+    except FileNotFoundError:
+        die("ssh not found -- install the OpenSSH client.")
+    if p.returncode != 0:
+        detail = (p.stderr or b"").decode("utf-8", "replace").strip() \
+            or ("ssh exit %d" % p.returncode)
+        die("port forward %s (%s) failed: %s" % (spec, action, detail),
+            code=2, error_code="conflict")
+    if action == "cancel":
+        print("✓ cancelled forward %s" % spec)
+        return
+    print("✓ forwarding http://localhost:%d -> %s:%d on the workspace"
+          % (local_port, host, remote_port))
+    print("  open it in your browser; stop it with "
+          "`runcode forward %d --cancel`." % remote_port)
+
+
+def cmd_run(args):
+    token = _load_token(args.token)
+    ws_id, _ = _resolve_workspace(args.workspace, token, args.api_base)
+    meta, _, _ = _ensure_session(ws_id, token, args.api_base, args.ttl, args.force)
+    _set_current(ws_id)
+    cmd = list(args.command or [])
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    _exec_ssh(meta, cmd, getattr(args, "home", False),
+              remint=lambda: _ensure_session(ws_id, token, args.api_base, args.ttl, True)[0])
+
+
+def cmd_shell(args):
+    args.command = []
+    cmd_run(args)
+
+
+def cmd_exec(args):
+    """Run a command on the ATTACHED workspace (the one last connected to), without
+    repeating its name. This is the agent's shell for a sticky session: while
+    attached, route every command here instead of the local Bash tool."""
+    token = _load_token(args.token)
+    ws_id = _get_current()
+    if ws_id is None:
+        die("no attached workspace -- run `runcode connect <workspace>` first.")
+    cmd = list(args.command or [])
+    if cmd and cmd[0] == "--":
+        cmd = cmd[1:]
+    if not cmd:
+        die("nothing to run -- usage: runcode exec -- <command ...>")
+    meta, _, _ = _ensure_session(ws_id, token, args.api_base, args.ttl, args.force)
+    _set_current(ws_id)  # keep it the active target
+    _exec_ssh(meta, cmd, getattr(args, "home", False),
+              remint=lambda: _ensure_session(ws_id, token, args.api_base, args.ttl, True)[0])
+
+
+def cmd_status(args):
+    if not os.path.isdir(CACHE_ROOT):
+        print("no active RunCode SSH sessions")
+        return
+    rows = []
+    for name in sorted(os.listdir(CACHE_ROOT)):
+        d = os.path.join(CACHE_ROOT, name)
+        meta = _read_meta(d)
+        if not meta:
+            continue
+        rows.append((meta.get("ws_id"), meta.get("user"),
+                     _fmt_remaining(meta), meta.get("config")))
+    if not rows:
+        print("no active RunCode SSH sessions")
+        return
+    for ws_id, user, rem, cfg in rows:
+        print("ws #%s  %s  expires %s\n    ssh -F %s runcode-%s"
+              % (ws_id, user, rem, cfg, user))
+
+
+def cmd_current(args):
+    """Show the attached workspace (the sticky target for `exec`), if any."""
+    cur = _get_current()
+    if cur is None:
+        print("no attached workspace -- run `runcode connect <workspace>`.")
+        return
+    d = _ws_cache_dir(cur)
+    meta = _read_meta(d)
+    if not meta or not _session_live(meta, d):
+        print("attached to ws #%d, but its session has expired -- reconnect." % cur)
+        return
+    host = _safe_display(_web_host(meta) or meta.get("user")) or ("ws-%d" % cur)
+    print("attached to %s (ws #%d), expires %s" % (host, cur, _fmt_remaining(meta)))
+    print("  run on it:   runcode exec -- <command>")
+    print("  disconnect:  runcode disconnect")
+
+
+def cmd_disconnect(args):
+    """Detach from the workspace: stop routing work to it (so `exec` refuses) and
+    drop its cached session, unless --keep. After this, work happens locally again."""
+    cur = _get_current()
+    _clear_current()
+    if cur is None:
+        print("no attached workspace")
+        return
+    if args.keep:
+        print("detached from ws #%d (cached session kept)" % cur)
+        return
+    d = _ws_cache_dir(cur)
+    _close_master(d)
+    if os.path.isdir(d):
+        _rmtree(d)
+    print("disconnected from ws #%d (session dropped)" % cur)
+
+
+def _dir_in_scope(session_dir, scope_dir):
+    """True when a Claude Code session's dir belongs to the attach dir: equal, or
+    one nested under the other. Compares by path COMPONENT (so /p/abc is not in
+    scope of /p/a) and tolerates a trailing separator."""
+    if not session_dir or not scope_dir:
+        return False
+    a = session_dir.rstrip("/\\")
+    b = scope_dir.rstrip("/\\")
+    if a == b:
+        return True
+    return a.startswith(b + os.sep) or b.startswith(a + os.sep)
+
+
+def _statusline_session_dirs():
+    """The directories of the Claude Code session asking for the status line,
+    read from the JSON Claude Code pipes to a statusLine command on stdin
+    (`workspace.current_dir` / `workspace.project_dir` / `cwd`).
+
+    Returns None when there is no piped JSON at all (a tty, or `runcode
+    statusline` run by hand) so the caller shows the segment unscoped; returns []
+    when JSON arrived but named no dir (lenient -> also shown). Never blocks (a
+    tty stdin is skipped, never read) and never raises."""
+    try:
+        stdin = sys.stdin
+        if stdin is None or stdin.isatty():
+            return None
+        raw = stdin.read()
+    except Exception:
+        return None
+    if not raw or not raw.strip():
+        return None
+    try:
+        data = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    found = []
+    ws = data.get("workspace")
+    if isinstance(ws, dict):
+        for key in ("current_dir", "project_dir"):
+            val = ws.get(key)
+            if isinstance(val, str) and val:
+                found.append(val)
+    cwd = data.get("cwd")
+    if isinstance(cwd, str) and cwd:
+        found.append(cwd)
+    dirs = []
+    for d in found:
+        try:
+            dirs.append(os.path.realpath(d))
+        except OSError:
+            dirs.append(d)
+    return dirs
+
+
+def cmd_statusline(args):
+    """One short line naming the currently-connected workspace + time left, for a
+    CLI status line. Prints NOTHING when no session is live (so the status-line
+    segment simply disappears), or when the asking Claude Code session is not the
+    one that attached the workspace (the pointer is machine-global, so we scope
+    the segment to the attaching session/project). Never errors: a status line
+    must not break."""
+    try:
+        meta = _current_session()
+    except Exception:
+        return
+    if not meta:
+        return
+    # Scope to the session/project that attached. Show when the scope is unknown
+    # (a legacy pointer) or the session dirs are unknown (manual run) -- only
+    # actively hide when we KNOW both and they don't match.
+    try:
+        scope = _get_current_scope()
+        if scope:
+            session_dirs = _statusline_session_dirs()
+            if session_dirs and not any(
+                    _dir_in_scope(d, scope) for d in session_dirs):
+                return
+    except Exception:
+        pass
+    name = _safe_display(_web_host(meta) or meta.get("user")) or ("ws-%s" % meta.get("ws_id"))
+    rem = _fmt_remaining(meta).replace("in ~", "~")
+    if args.plain:
+        print("working-on:%s %s" % (name, rem))
+        return
+    exp = _parse_expiry(meta.get("expires_at"))
+    secs = int((exp - datetime.now(timezone.utc)).total_seconds()) if exp else 0
+    # LOUD highlighted block: black text on green, yellow <5m, red <2m left.
+    bg = "41" if secs < 120 else ("43" if secs < 300 else "42")
+    print("\033[1;30;%sm ⬡ working-on:%s · %s \033[0m" % (bg, name, rem))
+
+
+# --- status-line auto-wiring ---------------------------------------------- #
+# Claude Code plugins can't inject a top-level `statusLine` (and
+# ${CLAUDE_PLUGIN_ROOT} isn't expanded in settings.json), so we wire it in with
+# one command, using THIS script's absolute path.
+
+def _settings_path():
+    base = os.environ.get("CLAUDE_CONFIG_DIR") or os.path.expanduser("~/.claude")
+    return os.path.join(base, "settings.json")
+
+
+def _self_command():
+    """The absolute `runcode statusline` invocation for settings.json. On
+    Windows the extensionless script can't be run directly as a status-line
+    command, so target the .cmd shim if present, else `python <script>`."""
+    script = os.path.realpath(__file__)
+    if _IS_WINDOWS:
+        shim = script + ".cmd"
+        if os.path.isfile(shim):
+            return '"%s" statusline' % shim
+        return '%s "%s" statusline' % (_python_exe(), script)
+    return script + " statusline"
+
+
+def _is_our_statusline(sl):
+    return isinstance(sl, dict) and "runcode" in str(sl.get("command", ""))
+
+
+def _statusline_installed():
+    """True if the user's Claude Code settings.json already wires OUR status line.
+
+    Best-effort and side-effect-free: a missing / unreadable / non-JSON settings
+    file just reads as False, so a caller (connect, doctor) can deterministically
+    decide whether to OFFER `install-statusline` without ever raising. The sticky
+    session silently routes all work to the remote box, so this cue is the user's
+    main standing signal -- worth nudging when it's absent."""
+    path = _settings_path()
+    if not os.path.isfile(path):
+        return False
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            settings = json.load(fh)
+    except (OSError, ValueError):
+        return False
+    return isinstance(settings, dict) and _is_our_statusline(settings.get("statusLine"))
+
+
+def _write_settings(path, settings):
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
+    if os.path.isfile(path):
+        try:
+            shutil.copy2(path, path + ".bak")
+        except OSError:
+            pass
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(settings, fh, indent=2)
+        fh.write("\n")
+    os.replace(tmp, path)
+
+
+def cmd_install_statusline(args):
+    """Wire (or remove) the workspace status line in the user's Claude Code
+    settings.json. Idempotent; backs up any existing file to settings.json.bak;
+    never touches a non-RunCode statusLine without --force."""
+    path = _settings_path()
+    settings = {}
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                settings = json.load(fh) or {}
+        except (OSError, ValueError):
+            die("could not read %s -- is it valid JSON?" % path)
+    if not isinstance(settings, dict):
+        die("%s does not contain a JSON object" % path)
+    existing = settings.get("statusLine")
+
+    if getattr(args, "remove", False):
+        if _is_our_statusline(existing):
+            settings.pop("statusLine", None)
+            _write_settings(path, settings)
+            print("removed the RunCode status line from %s" % path)
+        else:
+            print("no RunCode status line to remove in %s" % path)
+        return
+
+    command = _self_command()
+    if _is_our_statusline(existing) and existing.get("command") == command \
+            and not getattr(args, "force", False):
+        print("RunCode status line already installed in %s" % path)
+        return
+    if existing is not None and not _is_our_statusline(existing) \
+            and not getattr(args, "force", False):
+        die("a different statusLine is already configured in %s -- re-run with "
+            "--force to replace it (the old file is saved as %s.bak)."
+            % (path, path), code=2)
+
+    settings["statusLine"] = {"type": "command", "command": command, "padding": 0}
+    _write_settings(path, settings)
+    print("✓ installed the RunCode status line into %s" % path)
+    print("  it names the attached workspace + time left, and goes dark when you "
+          "disconnect.")
+    print("  remove it any time with `runcode install-statusline --remove`.")
+
+
+def cmd_list(args):
+    global _JSON_MODE
+    _JSON_MODE = bool(getattr(args, "json", False))
+    token = _load_token(args.token)
+    wss = _fetch_workspaces(token, args.api_base)
+    # Hide workspaces SSH can't reach unless --all asks for everything.
+    shown = wss if args.all else [w for w in wss if _ssh_capable(w)]
+
+    if args.json:
+        # Emit only the public shape — never the internal `provider` gate field.
+        out = []
+        for w in shown:
+            d = {k: v for k, v in w.items() if k != "provider"}
+            d["connectable"] = _ws_connectable(w)
+            out.append(d)
+        print(json.dumps(out, indent=2))
+        return
+
+    if not wss:
+        print("no workspaces found for this account.")
+        return
+    if not shown:
+        print("no SSH-connectable workspaces found. Run "
+              "`runcode list --all` to see every workspace.")
+        return
+
+    print("Your RunCode workspaces:")
+    for w in shown:
+        # custom_title is free-form user input (a teammate's, on a shared box) and
+        # title arrives from the server -- sanitize before echoing to the terminal.
+        name = _safe_display(w["custom_title"] or w["title"]) or ("ws-%d" % w["id"])
+        if _ws_connectable(w):
+            note = "running   → runcode connect %d" % w["id"]
+        elif _ssh_capable(w):
+            # Stopped but SSH-capable: `connect --start` boots it in-tool, so point
+            # there -- never send the user to the dashboard (the whole feature is
+            # that they don't need it).
+            note = "%-9s → runcode connect %d --start" % (
+                (w["state"] or "unknown"), w["id"])
+        else:
+            note = "%-9s (SSH not available)" % (w["state"] or "unknown")
+        shared = "  [shared]" if w["shared"] else ""
+        print("  #%-6d %-28.28s %s%s" % (w["id"], name, note, shared))
+
+
+def _close_master(d):
+    """Best-effort: tell a lingering ssh ControlMaster for this session to exit, so
+    no multiplexing socket/process outlives the session. Called before the cache is
+    dropped (disconnect/stop/clean). No-op on Windows (no ControlMaster) or when the
+    dir has no usable session config."""
+    if _IS_WINDOWS:
+        return
+    meta = _read_meta(d)
+    if not meta:
+        return
+    cfg, alias = meta.get("config"), meta.get("alias")
+    if not cfg or not alias or not os.path.isfile(cfg):
+        return
+    try:
+        subprocess.call([_ssh_exe(), "-F", cfg, "-O", "exit", alias],
+                        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                        timeout=10)
+    except (OSError, subprocess.SubprocessError):
+        pass
+
+
+def _rmtree(d):
+    for root, dirs, files in os.walk(d, topdown=False):
+        for f in files:
+            try:
+                os.remove(os.path.join(root, f))
+            except OSError:
+                pass
+        for dd in dirs:
+            try:
+                os.rmdir(os.path.join(root, dd))
+            except OSError:
+                pass
+    try:
+        os.rmdir(d)
+    except OSError:
+        pass
+
+
+def cmd_clean(args):
+    if not os.path.isdir(CACHE_ROOT):
+        print("nothing to clean")
+        return
+    if args.all or not args.workspace:
+        for name in os.listdir(CACHE_ROOT):
+            _close_master(os.path.join(CACHE_ROOT, name))
+        _rmtree(CACHE_ROOT)
+        print("removed all cached RunCode SSH sessions")
+        return
+    # Resolve to an id only if needed (numeric passes straight through).
+    if re.fullmatch(r"\d+", args.workspace.strip()):
+        ws_id = int(args.workspace)
+    else:
+        ws_id, _ = _resolve_workspace(args.workspace, _load_token(args.token), args.api_base)
+    d = _ws_cache_dir(ws_id)
+    if os.path.isdir(d):
+        _close_master(d)
+        _rmtree(d)
+        print("removed cached session for ws #%d" % ws_id)
+    else:
+        print("no cached session for ws #%d" % ws_id)
+
+
+def cmd_login(args):
+    _require_secure_base(args.api_base, "API base")
+    if not args.paste:
+        _require_secure_base(args.web_base, "web base")
+    if args.paste:
+        token = getpass.getpass("Paste your RunCode API token: ").strip()
+        if not token:
+            die("no token entered.")
+        path = _save_token(token)
+        ok = _verify_token(token, args.api_base)
+        note = "" if ok else " (warning: could not verify it against %s)" % args.api_base
+        print("✓ token saved to %s%s" % (path, note))
+        return
+
+    def opener(url):
+        print("Opening your browser to authorize RunCode CLI access…")
+        print("  If it does not open, visit this URL manually:\n    %s" % url)
+        # The URL is printed right before a ~180s blocking wait for the browser
+        # callback. Flush now so an agent reading this in a background shell sees
+        # the URL immediately, instead of only when the process exits (after the
+        # click) -- stdout is block-buffered when it is not a TTY.
+        sys.stdout.flush()
+        if not args.no_browser:
+            try:
+                webbrowser.open(url)
+            except Exception:
+                pass
+
+    token, email = _do_browser_login(args.web_base, opener, args.timeout)
+    path = _save_token(token)
+    print("✓ Logged in%s" % ((" as " + email) if email else ""))
+    print("  token saved to %s" % path)
+
+
+def cmd_logout(args):
+    path = _token_path()
+    if os.path.exists(path):
+        os.remove(path)
+        print("logged out -- removed %s" % path)
+    else:
+        print("not logged in (no %s)" % path)
+
+
+def _doctor_checks(args):
+    """Preflight: can THIS machine talk to RunCode? Returns (results, ok). Each
+    result is {name, status('ok'|'warn'|'fail'), detail}; ok is False iff any
+    check is 'fail'. Only reads the interpreter/PATH/env/token file plus one
+    best-effort network probe, so it renders as either text or JSON. Cross-platform
+    first-run check (no real Windows box needed to tell a user what's missing)."""
+    results = []
+
+    def add(name, status, detail):
+        results.append({"name": name, "status": status, "detail": detail})
+
+    v = sys.version_info
+    add("python", "ok" if v >= (3, 8) else "fail",
+        "%d.%d.%d%s" % (v.major, v.minor, v.micro,
+                        "" if v >= (3, 8) else " (need >= 3.8)"))
+
+    for tool in ("ssh", "ssh-keygen"):
+        found = shutil.which(tool)
+        add(tool, "ok" if found else "fail",
+            found or "not found on PATH -- install the OpenSSH client")
+
+    tok, src = None, None
+    if getattr(args, "token", None):
+        tok, src = args.token.strip(), "--token"
+    elif os.environ.get("RUNCODE_TOKEN"):
+        tok, src = os.environ["RUNCODE_TOKEN"].strip(), "RUNCODE_TOKEN env"
+    else:
+        p = _token_path()
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as fh:
+                    tok = fh.readline().strip()
+                src = p
+            except OSError:
+                tok = None
+    add("token", "ok" if tok else "warn",
+        ("found (%s)" % src) if tok else "none yet -- run `runcode login`")
+
+    base = getattr(args, "api_base", DEFAULT_API_BASE)
+    secure = _base_is_secure(base)
+    add("api-base", "ok" if secure else "fail",
+        base if secure else base + "  (must be https:// or http loopback)")
+
+    add("platform", "ok", "%s; config=%s cache=%s"
+        % (sys.platform, _config_home(), _cache_home()))
+
+    # Advisory only (never a 'fail'): the workspace cue is the user's standing
+    # signal that work is going to the remote box, but a missing one doesn't stop
+    # you connecting -- so nudge, don't block.
+    if _statusline_installed():
+        add("status-line", "ok", "the workspace cue is wired into your settings.json")
+    else:
+        add("status-line", "warn",
+            "not wired -- `runcode install-statusline` keeps the attached "
+            "workspace visible")
+
+    # Best-effort online probe. A failure here is a warning (network down / token
+    # expired), never a hard fail; skipped when we can't safely try.
+    if tok and secure:
+        try:
+            online = _verify_token(tok, base)
+        except SystemExit:
+            online = False
+        add("auth", "ok" if online else "warn",
+            ("token authorized against %s" % base) if online
+            else "could not authorize (network down, or token invalid/expired)")
+    else:
+        add("auth", "warn", "skipped (need a token + an https base)")
+
+    return results, all(r["status"] != "fail" for r in results)
+
+
+def cmd_doctor(args):
+    results, ok = _doctor_checks(args)
+    if getattr(args, "json", False):
+        print(json.dumps({"ok": ok, "checks": results}, indent=2))
+        sys.exit(0 if ok else 1)
+    sym = {"ok": "✓", "warn": "⚠", "fail": "✗"}
+    print("runcode doctor:")
+    for r in results:
+        print("  %s %-11s %s" % (sym.get(r["status"], "?"), r["name"], r["detail"]))
+    print("  => %s" % ("all good -- you're ready to `connect`" if ok
+                       else "problems found (fix the ✗ lines above)"))
+    sys.exit(0 if ok else 1)
+
+
+# --------------------------------------------------------------------------- #
+# config-ssh -- let the user's OWN tools (VS Code Remote, JetBrains, git, scp,
+# rsync, plain `ssh`) reach a workspace via a managed ~/.ssh/config block.
+#
+# Everything the gateway routes on is STABLE per workspace (HostName/Port/User =
+# ws.title); only the short-lived key expires. So the block is static, and the one
+# thing that goes stale is refreshed by a `proxy` ProxyCommand on every connect
+# (Coder's `ProxyCommand coder ssh --stdio %h` shape). proxy dials the real gateway
+# itself and pins its host key into a shared known_hosts, so the block never names
+# the gateway and stays valid for a stopped box (proxy mints once it's started).
+
+# Synthetic HostName the host blocks use; proxy re-keys the gateway's real host key
+# to this name so StrictHostKeyChecking still verifies without the block ever naming
+# the gateway. No Port is set (default 22), so the known_hosts key is unbracketed.
+GATEWAY_ALIAS = "runcode-gateway"
+SSH_CONFIG_BEGIN = "# >>> runcode managed block (do not edit) >>>"
+SSH_CONFIG_END = "# <<< runcode managed block <<<"
+
+# A workspace title is interpolated into ssh_config Host/User lines; restrict it to
+# a charset that can't break out into another directive (defense in depth -- the
+# backend already slug-validates titles, but a compromised/MITM'd list response
+# must not be able to inject ssh config locally).
+_SAFE_HOST_TITLE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _ssh_config_path():
+    return os.path.join(os.path.expanduser("~"), ".ssh", "config")
+
+
+def _gateway_known_hosts_path():
+    """Shared known_hosts the config-ssh blocks pin; proxy (re)writes it on connect."""
+    return os.path.join(CACHE_ROOT, "gateway_known_hosts")
+
+
+def _self_proxy_command(ws_id, api_base=None):
+    """The ProxyCommand line for a host block: this script's absolute path +
+    `proxy <id>` (quoted for spaces). Carries --api-base only when it isn't the
+    default, so a custom control plane keeps working. Windows can't run the
+    extensionless script directly -> the .cmd shim, else `python <script>`."""
+    extra = ""
+    if api_base and api_base != DEFAULT_API_BASE:
+        extra = " --api-base %s" % api_base
+    script = os.path.realpath(__file__)
+    if _IS_WINDOWS:
+        shim = script + ".cmd"
+        if os.path.isfile(shim):
+            return '"%s" proxy %d%s' % (shim, ws_id, extra)
+        return '"%s" "%s" proxy %d%s' % (_python_exe(), script, ws_id, extra)
+    return '"%s" proxy %d%s' % (script, ws_id, extra)
+
+
+def _safe_comment(s):
+    """A single printable line safe to drop after `# ` in ssh_config (custom titles
+    are user-set, so a stray newline would otherwise inject a directive)."""
+    return re.sub(r"[^\x20-\x7e]", " ", str(s or "")).strip() or "workspace"
+
+
+def _safe_display(s):
+    """Collapse a server- or remote-supplied string to a single terminal-safe line:
+    strip C0/C1 control bytes (ESC/CR/LF/BEL/...) and DEL -- the bytes a hostile
+    workspace title (a teammate's free-form custom_title) or a compromised box's
+    `context` output would use for ANSI/OSC terminal spoofing (cursor moves, title
+    rewrite, OSC 52 clipboard) -- while keeping printable Unicode. '' if empty."""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f]", " ", str(s or "")).strip()
+
+
+def _render_managed_block(workspaces, api_base=None):
+    """Build the managed ~/.ssh/config block: one `Host runcode.<title>` per
+    workspace, each reaching the gateway through `runcode proxy <id>`."""
+    kh = _gateway_known_hosts_path()
+    out = [
+        SSH_CONFIG_BEGIN,
+        "# Generated by `runcode config-ssh` -- re-run to refresh, "
+        "`runcode config-ssh --remove` to delete. Edits here are overwritten.",
+        "",
+    ]
+    for w in workspaces:
+        title = w.get("title") or ""
+        if not _SAFE_HOST_TITLE.match(title):
+            continue  # never write an unsafe title into ssh_config
+        wid = int(w["id"])
+        idf = os.path.join(_ws_cache_dir(wid), "id_ed25519")
+        out += [
+            "Host runcode.%s" % title,
+            "  # %s (ws #%d)" % (_safe_comment(w.get("custom_title") or title), wid),
+            "  HostName %s" % GATEWAY_ALIAS,
+            "  User %s" % title,
+            "  ProxyCommand %s" % _self_proxy_command(wid, api_base),
+            '  IdentityFile "%s"' % idf,
+            "  IdentitiesOnly yes",
+            '  UserKnownHostsFile "%s"' % kh,
+            "  GlobalKnownHostsFile %s" % os.devnull,
+            "  StrictHostKeyChecking yes",
+            "  CheckHostIP no",
+            "",
+        ]
+    out.append(SSH_CONFIG_END)
+    return "\n".join(out)
+
+
+def _strip_managed_block(text):
+    """Return `text` with the first well-formed runcode managed block removed.
+    A block whose END marker is missing is left untouched (never truncate the
+    user's file on a corrupted marker)."""
+    lines = text.split("\n")
+    begin = None
+    for i, ln in enumerate(lines):
+        if ln.strip() == SSH_CONFIG_BEGIN:
+            begin = i
+            break
+    if begin is None:
+        return text
+    end = None
+    for i in range(begin + 1, len(lines)):
+        if lines[i].strip() == SSH_CONFIG_END:
+            end = i
+            break
+    if end is None:
+        return text
+    del lines[begin:end + 1]
+    # collapse a blank line orphaned at the seam
+    while begin < len(lines) and lines[begin].strip() == "" and \
+            (begin == 0 or lines[begin - 1].strip() == ""):
+        del lines[begin]
+    return "\n".join(lines)
+
+
+def _write_ssh_config(path, text):
+    """Atomically write the ssh config (dir 0700, file 0600), backing up any
+    existing file to <path>.bak first."""
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        try:
+            os.chmod(d, 0o700)
+        except OSError:
+            pass
+    if os.path.isfile(path):
+        try:
+            shutil.copy2(path, path + ".bak")
+        except OSError:
+            pass
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+
+def cmd_config_ssh(args):
+    """Write (or remove) managed ~/.ssh/config host entries so the user's own
+    tools -- VS Code Remote-SSH, JetBrains Gateway, git, scp, rsync, plain ssh --
+    reach each workspace at `ssh runcode.<title>`, with the short-lived key
+    refreshed transparently on every connect by the `proxy` ProxyCommand."""
+    path = _ssh_config_path()
+    existing = ""
+    if os.path.isfile(path):
+        try:
+            with open(path, "r", encoding="utf-8") as fh:
+                existing = fh.read()
+        except OSError as exc:
+            die("could not read %s: %s" % (path, exc))
+    base = _strip_managed_block(existing)
+
+    if getattr(args, "remove", False):
+        if base == existing:
+            print("no runcode managed block in %s" % path)
+            return
+        _write_ssh_config(path, base.rstrip("\n") + "\n" if base.strip() else "")
+        print("removed the runcode managed block from %s" % path)
+        return
+
+    token = _load_token(args.token)
+    wss = [w for w in _fetch_workspaces(token, args.api_base) if _ssh_capable(w)]
+    if not wss:
+        die("no SSH-capable workspaces to configure -- `runcode list --all` "
+            "shows your workspaces.", error_code="not_found")
+    block = _render_managed_block(wss, args.api_base)
+    head = base.rstrip("\n") + "\n\n" if base.strip() else ""
+    _write_ssh_config(path, head + block + "\n")
+    print("✓ wrote %d workspace host(s) to %s" % (len(wss), path))
+    for w in wss:
+        if not _SAFE_HOST_TITLE.match(w.get("title") or ""):
+            continue
+        state = "running" if _ws_connectable(w) else (w.get("state") or "stopped")
+        print("    ssh runcode.%-22s  # %s" % (w["title"], state))
+    print("  works with: ssh / git / scp / rsync / VS Code Remote-SSH / JetBrains Gateway")
+    print("  a stopped box? `runcode connect %s --start` first." % wss[0]["id"])
+    print("  remove any time: runcode config-ssh --remove")
+
+
+def _gateway_known_hosts_content(raw, hostname=GATEWAY_ALIAS):
+    """Re-key each `<hostpat> <keytype> <blob>` line of `raw` (the bundle's pinned
+    gateway known_hosts) to `<hostname> <keytype> <blob>`, so the config-ssh blocks
+    -- which connect under the synthetic HostName -- still verify the host key."""
+    out = []
+    for ln in (raw or "").splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith("#"):
+            continue
+        parts = ln.split(None, 1)
+        if len(parts) == 2:
+            out.append("%s %s" % (hostname, parts[1]))
+    return "\n".join(out) + ("\n" if out else "")
+
+
+def _relay_stdio(host, port, connect_timeout=20):
+    """Raw bidirectional byte relay between this process's stdin/stdout and a TCP
+    connection to host:port -- the ProxyCommand transport: ssh speaks the SSH
+    protocol over our stdio and we shuttle it to the gateway. STDOUT IS THE SSH
+    CHANNEL, so this writes nothing else there; diagnostics go to stderr. Two
+    threads (not select) so it's portable to Windows, where select() can't watch
+    stdio handles."""
+    import socket
+    import threading
+    try:
+        sock = socket.create_connection((host, int(port)), timeout=connect_timeout)
+    except OSError as exc:
+        die("proxy: cannot reach the gateway %s:%s -- %s" % (host, port, exc), code=2)
+    sock.settimeout(None)
+    sin = getattr(sys.stdin, "buffer", sys.stdin)
+    sout = getattr(sys.stdout, "buffer", sys.stdout)
+
+    def _pump_in():  # socket -> stdout
+        try:
+            while True:
+                chunk = sock.recv(65536)
+                if not chunk:
+                    break
+                sout.write(chunk)
+                sout.flush()
+        except OSError:
+            pass
+
+    reader = threading.Thread(target=_pump_in, daemon=True)
+    reader.start()
+    try:
+        while True:
+            chunk = sin.read1(65536) if hasattr(sin, "read1") else sin.read(65536)
+            if not chunk:
+                break
+            sock.sendall(chunk)
+    except OSError:
+        pass
+    finally:
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
+    reader.join()
+    try:
+        sock.close()
+    except OSError:
+        pass
+
+
+def cmd_proxy(args):
+    """The ProxyCommand target the config-ssh blocks point at. Refresh the
+    short-lived session for ONE workspace (reusing a still-valid one so VS Code's
+    many connections don't each mint), pin the gateway host key into the shared
+    known_hosts the blocks trust, then relay stdin/stdout to the gateway. Hidden
+    from --help: users never run it directly."""
+    token = _load_token(args.token)
+    if not re.fullmatch(r"\d+", str(args.workspace).strip()):
+        die("proxy expects a numeric workspace id (config-ssh writes ids).")
+    ws_id = int(args.workspace)
+    meta, d, _ = _ensure_session(ws_id, token, args.api_base, args.ttl,
+                                 getattr(args, "force", False))
+    try:
+        with open(os.path.join(d, "known_hosts"), "r", encoding="utf-8") as fh:
+            raw_kh = fh.read()
+        khp = _gateway_known_hosts_path()
+        kd = os.path.dirname(khp)
+        if kd:
+            os.makedirs(kd, mode=0o700, exist_ok=True)
+        with open(khp, "w", encoding="utf-8") as fh:
+            fh.write(_gateway_known_hosts_content(raw_kh))
+        os.chmod(khp, 0o600)
+    except OSError:
+        # If we couldn't write the pin, ssh's StrictHostKeyChecking refuses the
+        # connection (missing key) -- it self-protects, so relaying is still safe.
+        pass
+    _relay_stdio(meta["host"], meta["port"])
+
+
+# --------------------------------------------------------------------------- #
+
+def build_parser():
+    p = argparse.ArgumentParser(
+        prog="runcode",
+        description="Mint a short-lived SSH session to a RunCode workspace.",
+    )
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    def add_common(sp, ttl=False):
+        sp.add_argument("--api-base", default=DEFAULT_API_BASE,
+                        help="RunCode backend base URL (default %(default)s)")
+        sp.add_argument("--token", default=None,
+                        help="RunCode API token (prefer RUNCODE_TOKEN env)")
+        sp.add_argument("--force", action="store_true",
+                        help="re-mint even if a cached session is still valid")
+        if ttl:
+            sp.add_argument("--ttl", type=int, default=DEFAULT_TTL,
+                            help="requested session seconds (server caps; default %(default)s)")
+
+    c = sub.add_parser("connect", help="mint/refresh a session and print how to use it")
+    c.add_argument("workspace", help="workspace name or numeric id")
+    c.add_argument("--json", action="store_true", help="machine-readable output")
+    c.add_argument("--start", action="store_true",
+                   help="if the workspace is stopped, start it first (waits for running)")
+    c.add_argument("--wait", action="store_true",
+                   help="block until the workspace actually answers SSH before returning")
+    c.add_argument("--timeout", type=int, default=DEFAULT_READY_TIMEOUT,
+                   help="max seconds to wait for --start/--wait readiness (default %(default)s)")
+    add_common(c, ttl=True)
+    c.set_defaults(func=cmd_connect)
+
+    sp = sub.add_parser("stop",
+                        help="stop a workspace on the control plane (pauses compute billing)")
+    sp.add_argument("workspace", nargs="?",
+                    help="workspace name or id (default: the attached one)")
+    sp.add_argument("--json", action="store_true", help="machine-readable output")
+    sp.add_argument("--keep", action="store_true",
+                    help="when stopping the attached box, keep its cached session material")
+    sp.add_argument("--api-base", default=DEFAULT_API_BASE,
+                    help="RunCode backend base URL (default %(default)s)")
+    sp.add_argument("--token", default=None,
+                    help="RunCode API token (prefer RUNCODE_TOKEN env)")
+    sp.set_defaults(func=cmd_stop)
+
+    r = sub.add_parser("run", help="run a remote command (everything after -- is the command)")
+    r.add_argument("workspace", help="workspace name or numeric id")
+    r.add_argument("--home", action="store_true",
+                   help="run from the home dir instead of the workspace project dir")
+    r.add_argument("command", nargs=argparse.REMAINDER, help="-- <command ...>")
+    add_common(r, ttl=True)
+    r.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("shell", help="open an interactive shell on the workspace")
+    s.add_argument("workspace", help="workspace name or numeric id")
+    add_common(s, ttl=True)
+    s.set_defaults(func=cmd_shell)
+
+    ex = sub.add_parser("exec",
+                        help="run a command on the ATTACHED workspace (no name needed)")
+    ex.add_argument("--home", action="store_true",
+                    help="run from the home dir instead of the workspace project dir")
+    ex.add_argument("command", nargs=argparse.REMAINDER, help="-- <command ...>")
+    add_common(ex, ttl=True)
+    ex.set_defaults(func=cmd_exec)
+
+    cx = sub.add_parser(
+        "context",
+        help="one-shot workspace digest (cwd, git, project, tool versions) for the agent")
+    cx.add_argument("workspace", nargs="?",
+                    help="workspace name or id (default: the attached one)")
+    cx.add_argument("--json", action="store_true", help="machine-readable digest")
+    cx.add_argument("--timeout", type=int, default=30,
+                    help="max seconds for the probe (default %(default)s)")
+    add_common(cx, ttl=True)
+    cx.set_defaults(func=cmd_context)
+
+    wr = sub.add_parser("write",
+                        help="write a file on the ATTACHED workspace from stdin (or --file)")
+    wr.add_argument("path",
+                    help="remote path (relative paths resolve against the project dir)")
+    wr.add_argument("--file", default=None,
+                    help="read from this LOCAL file instead of stdin")
+    add_common(wr, ttl=True)
+    wr.set_defaults(func=cmd_write)
+
+    pu = sub.add_parser("put", help="upload a LOCAL file to the ATTACHED workspace")
+    pu.add_argument("local", help="local file to upload")
+    pu.add_argument("remote",
+                    help="remote path (relative resolves against the project dir)")
+    add_common(pu, ttl=True)
+    pu.set_defaults(func=cmd_put)
+
+    ge = sub.add_parser("get", help="download a file from the ATTACHED workspace")
+    ge.add_argument("remote",
+                    help="remote path (relative resolves against the project dir)")
+    ge.add_argument("--out", default=None,
+                    help="local path to write to (default: stdout)")
+    add_common(ge, ttl=True)
+    ge.set_defaults(func=cmd_get)
+
+    fw = sub.add_parser("forward",
+                        help="expose a workspace port locally (e.g. a dev server)")
+    fw.add_argument("port", type=int, help="the port on the workspace to expose")
+    fw.add_argument("--local", type=int, default=None,
+                    help="local port to listen on (default: same as the remote port)")
+    fw.add_argument("--to", default=None,
+                    help="host on the workspace to reach (default: localhost)")
+    fw.add_argument("--cancel", action="store_true",
+                    help="remove a forward instead of adding it")
+    add_common(fw, ttl=True)
+    fw.set_defaults(func=cmd_forward)
+
+    cs = sub.add_parser(
+        "config-ssh",
+        help="write ~/.ssh/config entries so VS Code Remote / JetBrains / git reach your workspaces")
+    cs.add_argument("--remove", action="store_true",
+                    help="remove the runcode managed block instead of writing it")
+    cs.add_argument("--api-base", default=DEFAULT_API_BASE,
+                    help="RunCode backend base URL (default %(default)s)")
+    cs.add_argument("--token", default=None,
+                    help="RunCode API token (prefer RUNCODE_TOKEN env)")
+    cs.set_defaults(func=cmd_config_ssh)
+
+    # Internal: the ProxyCommand target for the config-ssh host blocks. Omitting
+    # `help=` keeps it out of the --help listing; users never invoke it directly.
+    px = sub.add_parser("proxy")
+    px.add_argument("workspace", help="numeric workspace id")
+    add_common(px, ttl=True)
+    px.set_defaults(func=cmd_proxy)
+
+    li = sub.add_parser("list", help="list your workspaces (running ones are SSH-connectable)")
+    li.add_argument("--json", action="store_true", help="machine-readable output")
+    li.add_argument("--all", action="store_true",
+                    help="include workspaces that can't be reached over SSH")
+    li.add_argument("--api-base", default=DEFAULT_API_BASE,
+                    help="RunCode backend base URL (default %(default)s)")
+    li.add_argument("--token", default=None,
+                    help="RunCode API token (prefer RUNCODE_TOKEN env)")
+    li.set_defaults(func=cmd_list)
+
+    st = sub.add_parser("status", help="list cached sessions")
+    st.set_defaults(func=cmd_status)
+
+    cu = sub.add_parser("current", help="show the attached workspace (sticky target for exec)")
+    cu.set_defaults(func=cmd_current)
+
+    dc = sub.add_parser("disconnect",
+                        help="detach from the workspace and drop its session (work reverts to local)")
+    dc.add_argument("--keep", action="store_true",
+                    help="just detach; keep the cached session material")
+    dc.set_defaults(func=cmd_disconnect)
+
+    sl = sub.add_parser("statusline",
+                        help="print a one-line segment for the current session (for a CLI status line)")
+    sl.add_argument("--plain", action="store_true",
+                    help="plain text, no color/emoji (for non-ANSI status lines)")
+    sl.set_defaults(func=cmd_statusline)
+
+    ist = sub.add_parser(
+        "install-statusline",
+        help="wire the workspace status line into your Claude Code settings.json",
+    )
+    ist.add_argument("--remove", action="store_true",
+                     help="remove the RunCode status line instead of installing it")
+    ist.add_argument("--force", action="store_true",
+                     help="replace an existing (non-RunCode) statusLine")
+    ist.set_defaults(func=cmd_install_statusline)
+
+    cl = sub.add_parser("clean", help="remove cached session material")
+    cl.add_argument("workspace", nargs="?", help="workspace name or id (omit with --all)")
+    cl.add_argument("--all", action="store_true", help="remove every cached session")
+    cl.add_argument("--api-base", default=DEFAULT_API_BASE, help=argparse.SUPPRESS)
+    cl.add_argument("--token", default=None, help=argparse.SUPPRESS)
+    cl.set_defaults(func=cmd_clean)
+
+    lg = sub.add_parser("login",
+                        help="authorize this machine via the browser and save an API token")
+    lg.add_argument("--web-base", default=DEFAULT_WEB_BASE,
+                    help="RunCode web host that renders the consent page (default %(default)s)")
+    lg.add_argument("--api-base", default=DEFAULT_API_BASE,
+                    help="RunCode API base used to verify the token (default %(default)s)")
+    lg.add_argument("--no-browser", action="store_true",
+                    help="print the authorize URL instead of opening a browser")
+    lg.add_argument("--paste", action="store_true",
+                    help="paste a token manually instead of using the browser flow")
+    lg.add_argument("--timeout", type=int, default=180,
+                    help="seconds to wait for the browser callback (default %(default)s)")
+    lg.set_defaults(func=cmd_login)
+
+    lo = sub.add_parser("logout", help="remove the saved API token")
+    lo.set_defaults(func=cmd_logout)
+
+    dr = sub.add_parser(
+        "doctor",
+        help="preflight this machine (python, OpenSSH client, token, base, reachability)",
+    )
+    dr.add_argument("--json", action="store_true", help="machine-readable output")
+    dr.add_argument("--api-base", default=DEFAULT_API_BASE,
+                    help="RunCode backend base URL (default %(default)s)")
+    dr.add_argument("--token", default=None,
+                    help="RunCode API token (prefer RUNCODE_TOKEN env)")
+    dr.set_defaults(func=cmd_doctor)
+
+    return p
+
+
+def main(argv=None):
+    # Run non-interactively (a coding agent runs us in a background shell, so
+    # stdout/stderr are pipes/files, not a TTY) Python block-buffers stdout.
+    # Line-buffer both streams so progress lines -- above all the `login`
+    # authorize URL printed just before a long blocking wait -- surface in real
+    # time rather than only when the process exits.
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(line_buffering=True)
+        except (AttributeError, ValueError):
+            pass
+    args = build_parser().parse_args(argv)
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        die("interrupted", code=130)
+
+
+if __name__ == "__main__":
+    main()

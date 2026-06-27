@@ -1,0 +1,11 @@
+{
+  "name": "runcode",
+  "owner": { "name": "RunCode", "url": "https://runcode.io" },
+  "plugins": [
+    {
+      "name": "runcode",
+      "source": ".",
+      "description": "Low-friction, secure SSH access from a coding agent into your RunCode workspace."
+    }
+  ]
+}

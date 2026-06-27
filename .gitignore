@@ -1,0 +1,22 @@
+# Python bytecode (the engine + tests are stdlib Python; running them drops these)
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Local runtime/session material — the plugin writes these OUTSIDE the repo
+# (~/.cache/runcode/, ~/.config/runcode/token); listed here only as a guard
+# in case anyone runs the engine from within the checkout.
+.cache/
+*.token
+
+# Environment / secrets
+.env
+.env.*
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*~
