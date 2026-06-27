@@ -1,0 +1,15 @@
+# Line-ending policy — critical for a cross-platform, GitHub-hosted plugin.
+#
+# The engine `bin/runcode` is an extensionless, shebang'd Python script that
+# macOS/Linux run DIRECTLY (`#!/usr/bin/env python3`). If git ever checks it
+# out with CRLF (a Windows clone with core.autocrlf=true would do exactly
+# that), the shebang becomes `…/python3\r` and POSIX fails it with
+# "bad interpreter: No such file or directory". So pin every text file to LF…
+* text=auto eol=lf
+
+# …force the engine + tests to LF no matter the client's autocrlf setting…
+bin/runcode      text eol=lf
+tests/test_engine.py text eol=lf
+
+# …and keep the Windows shim as CRLF (cmd.exe is happiest with CRLF).
+bin/runcode.cmd  text eol=crlf

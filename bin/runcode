@@ -1,4 +1,11 @@
-#!/usr/bin/env python3
+#!/bin/sh
+''''exec "$(command -v python3 || command -v python || command -v py)" "$0" "$@" # '''
+# ^ Python/sh polyglot launcher. POSIX kernels run line 1 (`/bin/sh`), which then
+# execs the first Python it finds; on Windows the .cmd shim (and `py -3 runcode`)
+# feed this file to Python directly, treating both lines above as a comment and a
+# no-op string. The fallback chain matters on Windows-via-Git-Bash, where the
+# agent runs this file by path and python.org ships `python.exe`/`py.exe` but no
+# `python3`. To Python the line above is just a string literal (a no-op).
 """runcode -- mint a short-lived SSH session to a RunCode workspace.
 
 A coding agent (Claude Code / Codex / an editor) runs this LOCALLY. It:
@@ -112,6 +119,26 @@ def _sshkeygen_exe():
 
 def _python_exe():
     return sys.executable or "python"
+
+
+def _force_binary_stdio(*streams):
+    """Put the given std streams into BINARY mode on Windows. Inherited stdio
+    pipes there default to TEXT mode, where the C runtime translates
+    0x0A<->0x0D0A and treats 0x1A as EOF on input -- which silently corrupts the
+    raw byte transfers this tool does: the `proxy` SSH relay, a `get` to stdout,
+    a binary `write` from stdin. No-op on POSIX. Best-effort: a stream with no
+    real fileno (a capture buffer under test) is simply skipped, never fatal."""
+    if not _IS_WINDOWS:
+        return
+    try:
+        import msvcrt
+    except ImportError:
+        return
+    for st in streams:
+        try:
+            msvcrt.setmode(st.fileno(), getattr(os, "O_BINARY", 0))
+        except (OSError, ValueError, AttributeError):
+            pass
 
 
 CACHE_ROOT = os.path.join(_cache_home(), "runcode")
@@ -1321,12 +1348,15 @@ def _attached_session(args):
 
 def cmd_write(args):
     """Write a file ON the attached workspace from local stdin (or --file <local>).
-    A relative path resolves against the project dir. Edit a file locally with your
-    native tools, then `write` it up — or pipe generated content straight in."""
+    Content streams base64 over the session straight into the remote file -- nothing
+    is staged on the local disk. A relative path resolves against the project dir.
+    Pipe/heredoc generated content straight in; use --file only when you already have
+    a real local file to upload (same idea as `put`)."""
     if getattr(args, "file", None):
         with open(args.file, "rb") as fh:
             data = fh.read()
     else:
+        _force_binary_stdio(sys.stdin)  # raw bytes in: no Windows CRLF/^Z mangling
         data = sys.stdin.buffer.read()
     meta = _attached_session(args)
     path = _remote_write(meta, args.path, data)
@@ -1352,6 +1382,7 @@ def cmd_get(args):
             fh.write(data)
         print("downloaded %s -> %s (%d bytes)" % (args.remote, out, len(data)))
     else:
+        _force_binary_stdio(sys.stdout)  # raw bytes out: no Windows CRLF mangling
         sys.stdout.buffer.write(data)
 
 
@@ -1684,6 +1715,76 @@ def cmd_install_statusline(args):
     print("  it names the attached workspace + time left, and goes dark when you "
           "disconnect.")
     print("  remove it any time with `runcode install-statusline --remove`.")
+
+
+def cmd_install_path(args):
+    """Expose `runcode` on the USER's own shell PATH. Claude Code already adds the
+    plugin's bin/ to the AGENT's Bash tool while the plugin is enabled, but NOT to
+    the user's interactive terminal -- this is for running the standalone CLI
+    yourself. POSIX: symlink the engine into ~/.local/bin (the conventional user
+    bindir). Windows: the runnable entry is runcode.cmd, so print its directory to
+    add to PATH -- no privileged symlink, no registry edit. `--remove` reverses
+    the POSIX symlink."""
+    script = os.path.realpath(__file__)
+    bindir = os.path.dirname(script)
+    remove = getattr(args, "remove", False)
+    path_dirs = [p for p in (os.environ.get("PATH") or "").split(os.pathsep) if p]
+
+    if _IS_WINDOWS:
+        if remove:
+            print("Nothing to remove: on Windows install-path only prints PATH "
+                  "guidance (it never symlinks). If you added %s to your PATH, "
+                  "remove it by hand." % bindir)
+            return
+        if any(os.path.normcase(os.path.normpath(p)) == os.path.normcase(bindir)
+               for p in path_dirs):
+            print("✓ %s is already on your PATH — `runcode` works in your terminal."
+                  % bindir)
+            return
+        print("To run `runcode` in your OWN terminal, add this directory to PATH:")
+        print("  %s" % bindir)
+        print("PowerShell (persists for your user):")
+        print('  setx PATH "$env:Path;%s"' % bindir)
+        print("then open a NEW terminal. (The coding agent already has it without this.)")
+        return
+
+    # POSIX: symlink the engine into ~/.local/bin.
+    target_dir = os.path.join(os.path.expanduser("~"), ".local", "bin")
+    link = os.path.join(target_dir, "runcode")
+    if remove:
+        if os.path.islink(link) and os.path.realpath(link) == script:
+            try:
+                os.unlink(link)
+            except OSError as exc:
+                die("could not remove %s: %s" % (link, exc))
+            print("removed %s" % link)
+        else:
+            print("no runcode symlink of ours at %s — nothing to remove." % link)
+        return
+    try:
+        os.makedirs(target_dir, exist_ok=True)
+    except OSError as exc:
+        die("could not create %s: %s" % (target_dir, exc))
+    if os.path.islink(link):
+        if os.path.realpath(link) == script:
+            print("✓ already linked: %s -> %s" % (link, script))
+        else:
+            die("%s is a symlink to something else -- remove it first (or "
+                "`runcode install-path --remove`)." % link, code=2)
+    elif os.path.exists(link):
+        die("%s already exists and isn't our symlink -- remove it first." % link,
+            code=2)
+    else:
+        try:
+            os.symlink(script, link)
+        except OSError as exc:
+            die("could not link %s -> %s: %s" % (link, script, exc))
+        print("✓ linked %s -> %s" % (link, script))
+    on_path = any(os.path.realpath(p) == os.path.realpath(target_dir) for p in path_dirs)
+    if not on_path:
+        print("note: %s isn't on your PATH yet. Add this to your shell rc "
+              "(~/.bashrc / ~/.zshrc), then open a new terminal:" % target_dir)
+        print('  export PATH="$HOME/.local/bin:$PATH"')
 
 
 def cmd_list(args):
@@ -2141,6 +2242,9 @@ def _relay_stdio(host, port, connect_timeout=20):
     stdio handles."""
     import socket
     import threading
+    # STDOUT/STDIN are the raw SSH channel here -- on Windows they must be binary
+    # or the CRT's CRLF translation corrupts the encrypted stream.
+    _force_binary_stdio(sys.stdin, sys.stdout)
     try:
         sock = socket.create_connection((host, int(port)), timeout=connect_timeout)
     except OSError as exc:
@@ -2379,6 +2483,14 @@ def build_parser():
     ist.add_argument("--force", action="store_true",
                      help="replace an existing (non-RunCode) statusLine")
     ist.set_defaults(func=cmd_install_statusline)
+
+    ip = sub.add_parser(
+        "install-path",
+        help="put `runcode` on your OWN shell PATH (the agent already has it)",
+    )
+    ip.add_argument("--remove", action="store_true",
+                    help="remove the symlink install-path created (POSIX)")
+    ip.set_defaults(func=cmd_install_path)
 
     cl = sub.add_parser("clean", help="remove cached session material")
     cl.add_argument("workspace", nargs="?", help="workspace name or id (omit with --all)")

@@ -75,8 +75,14 @@ Add the RunCode marketplace and install the plugin from inside Claude Code (one 
 (Equivalently from a shell: `claude plugin marketplace add runcode-io/claude-plugin` then
 `claude plugin install runcode@runcode`.)
 
-The skill then loads as **`/runcode:ssh`**, and `runcode` is on `PATH`. Run
+The skill then loads as **`/runcode:ssh`**. Claude Code adds the plugin's `bin/` to the
+**agent's** Bash-tool `PATH` while the plugin is enabled, so the agent invokes `runcode`
+by that bare name on every platform (on Windows it resolves to `runcode.cmd`). Run
 **`/runcode:login`** once to authorize this machine (**`/runcode:doctor`** checks your setup).
+
+Want to run `runcode` yourself in your **own** terminal (the standalone CLI below)? That
+PATH injection is for the agent only, so do it once: **`runcode install-path`** (POSIX
+symlinks the engine into `~/.local/bin`; Windows prints the directory to add to `PATH`).
 
 > **Hacking on the plugin itself?** Point Claude Code at a local checkout instead of the
 > marketplace — changes reload without a reinstall:
@@ -161,6 +167,7 @@ runcode shell my-workspace              # interactive shell
 runcode status                          # list cached sessions + expiry
 runcode statusline                      # one-line segment for a CLI status line
 runcode install-statusline              # wire that cue into Claude Code settings.json
+runcode install-path                    # put `runcode` on YOUR shell PATH (agent already has it)
 runcode clean --all                     # wipe cached keys/configs
 runcode logout                          # forget the saved token
 ```

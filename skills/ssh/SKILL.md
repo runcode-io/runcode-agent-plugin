@@ -27,7 +27,7 @@ SSH from the local machine — run commands, edit via `rsync`/`scp`, forward por
 When no token is saved, run the login command **yourself** (it's the agent's job, not the
 user's):
 ```bash
-"${CLAUDE_PLUGIN_ROOT}/bin/runcode" login
+runcode login
 ```
 1. First tell the user: *"A browser tab will open to authorize RunCode access — please click
    **Authorize**."*
@@ -51,17 +51,21 @@ everything else. After it succeeds, retry the original `connect`/`run`.
 - `runcode logout` forgets the saved token.
 
 ## The tool
-`"${CLAUDE_PLUGIN_ROOT}/bin/runcode"` (also on PATH as `runcode` once the plugin
-is loaded). Python 3 stdlib, no dependencies. It generates an ephemeral key, fetches a
-connection bundle, and writes an **isolated** ssh config with a **pinned host key** —
-`ssh -F <config>` ignores `~/.ssh` entirely, so it never offers the user's personal keys
-to the gateway and never edits their config.
+The command is **`runcode`** — invoke it by that bare name. Claude Code puts the
+plugin's `bin/` on the Bash tool's `PATH` while the plugin is enabled, so `runcode`
+resolves in every Bash call, identically on Windows/macOS/Linux (on Windows it resolves
+to `runcode.cmd`). In the rare case a shell reports `runcode: command not found`, fall
+back to the absolute path `${CLAUDE_PLUGIN_ROOT}/bin/runcode`. Python 3 stdlib, no
+dependencies. It generates an ephemeral key, fetches a connection bundle, and writes an
+**isolated** ssh config with a **pinned host key** — `ssh -F <config>` ignores `~/.ssh`
+entirely, so it never offers the user's personal keys to the gateway and never edits
+their config.
 
 ## Workflow
 
 0. **Don't know which workspace?** List them — never guess a name:
    ```bash
-   "${CLAUDE_PLUGIN_ROOT}/bin/runcode" list --json
+   runcode list --json
    ```
    Each entry has `id`, `title`, `custom_title`, `state`, and a `connectable` flag
    (running and SSH-capable). If exactly one is `connectable`, use it; otherwise show
@@ -72,7 +76,7 @@ to the gateway and never edits their config.
 1. **Establish a session** — start the box if it's stopped and wait until it actually
    answers SSH (reuses a cached session if one is still valid):
    ```bash
-   "${CLAUDE_PLUGIN_ROOT}/bin/runcode" connect "<workspace name or id>" --start --wait --json
+   runcode connect "<workspace name or id>" --start --wait --json
    ```
    Read `config` and `alias` from the JSON; `started: true` means it was stopped and you
    started it. The JSON also carries **`workdir`** (the project dir on the box — use it
@@ -98,7 +102,7 @@ to the gateway and never edits their config.
 1a. **Orient on the box — one round trip, right after connecting.** Don't probe the
    workspace with a dozen separate `exec`s; get a structured digest at once:
    ```bash
-   "${CLAUDE_PLUGIN_ROOT}/bin/runcode" context --json
+   runcode context --json
    ```
    It returns `cwd`, `os`/`arch`/`distro`, a `git` block (`branch`, `dirty`, `remote`,
    `head`), `markers` (project files present), and `tools` (name→version). Read it and
@@ -109,7 +113,7 @@ to the gateway and never edits their config.
    `exec` lands in the project dir (the `workdir` from connect) by default, so you no
    longer need a `cd …` prefix:
    ```bash
-   "${CLAUDE_PLUGIN_ROOT}/bin/runcode" exec -- pytest -q
+   runcode exec -- pytest -q
    ```
    The **first** `exec`/`connect` opens a shared (multiplexed) connection and every later
    `exec` reuses it, so commands after the first are near-instant rather than re-handshaking
@@ -120,14 +124,14 @@ to the gateway and never edits their config.
 
 3. **Interactive shell** — only when the user explicitly wants a terminal:
    ```bash
-   "${CLAUDE_PLUGIN_ROOT}/bin/runcode" shell "<workspace>"
+   runcode shell "<workspace>"
    ```
 
 4. **Forward a port** (e.g. a dev server running on the workspace) — adds the forward to
    the session and returns immediately, no blocking tunnel to babysit:
    ```bash
-   "${CLAUDE_PLUGIN_ROOT}/bin/runcode" forward 5173            # http://localhost:5173 -> box :5173
-   "${CLAUDE_PLUGIN_ROOT}/bin/runcode" forward 5173 --cancel   # remove it
+   runcode forward 5173            # http://localhost:5173 -> box :5173
+   runcode forward 5173 --cancel   # remove it
    ```
    **Offer this when you start a server on the box** — the user usually wants to see it.
    (Windows has no session master, so `forward` there prints an `ssh -L` command to run
@@ -137,8 +141,8 @@ to the gateway and never edits their config.
    box) — when the user wants to open the workspace in **their** VS Code Remote, JetBrains
    Gateway, or use plain `ssh`/`git`/`scp`/`rsync` themselves:
    ```bash
-   "${CLAUDE_PLUGIN_ROOT}/bin/runcode" config-ssh            # write ~/.ssh/config host entries
-   "${CLAUDE_PLUGIN_ROOT}/bin/runcode" config-ssh --remove   # take them back out
+   runcode config-ssh            # write ~/.ssh/config host entries
+   runcode config-ssh --remove   # take them back out
    ```
    This adds a delimited, backed-up, removable block to `~/.ssh/config` so each workspace is
    reachable as `runcode.<name>` (`ssh runcode.<name>`, `code --remote ssh-remote+runcode.<name>`,
@@ -189,22 +193,29 @@ to step outside it. SSH lands as `ubuntu`.
 - **Read a workspace file:** `runcode get <path>` (to stdout, or `--out <local>` to
   save it). Quick peeks can still use `runcode exec -- cat <path>`. Do **not** use the
   local `Read` tool — it reads your machine.
-- **Create / edit a workspace file:** prefer `runcode write <remote-path>`, which
-  streams the content base64-encoded over the session — so **any** content is safe (no
-  heredoc/quoting hazard, no `$VAR`/backtick expansion on the remote shell, no accidental
-  clobber from a stray redirect). Two natural patterns:
+- **Create / edit a workspace file — directly on the box, no local copy.** `runcode
+  write <remote-path>` streams content straight from stdin into the remote file
+  (base64 over the session): **nothing is written to your local disk**, and any
+  content is safe (no heredoc/quoting hazard, no `$VAR`/backtick expansion on the
+  remote shell, no clobber from a stray redirect). Generate the content in your
+  context and pipe/heredoc it in — do **not** author it with the local `Write` tool
+  first:
   ```bash
-  runcode write src/app.py <<'EOF'        # generate/replace from a heredoc
+  runcode write src/app.py <<'EOF'        # create or replace, content inline
   ...file contents...
   EOF
-  printf '%s' "$NEW" | runcode write src/app.py   # or pipe content in
-  runcode put ./local.py src/app.py        # …or edit locally then upload the file
+  printf '%s' "$NEW" | runcode write src/app.py   # or pipe generated content in
   ```
-  Paths are relative to the project dir (or absolute). For an in-place tweak,
-  `runcode exec -- sed -i 's/.../.../' <file>` still works; for many files,
-  `runcode put` each, or `rsync -az -e "ssh -F <config>" ./ <alias>:/home/ubuntu/workspace/`
-  (use the absolute project path — `rsync` drives its own `ssh`, so the `exec` cwd default
-  doesn't apply).
+  **To edit an existing file, don't stage it locally:** `runcode get <path>` (to
+  stdout) reads the current content into your context, change it there, then `runcode
+  write <path>` the new version back — still zero local files. For a one-liner in
+  place, `runcode exec -- sed -i 's/.../.../' <file>`. Paths are relative to the
+  project dir (or absolute).
+  - `runcode put ./local.py src/app.py` and `rsync -az -e "ssh -F <config>" ./
+    <alias>:/home/ubuntu/workspace/` (absolute project path — `rsync` drives its own
+    `ssh`, so the `exec` cwd default doesn't apply) are for when you **already have a
+    real local file/tree** to copy up. They are **not** a path to author workspace
+    content: never create a local file just to `put` it — `write` it directly.
 - **Check what's attached:** `runcode current`. There is exactly **one** attached
   workspace at a time (the sticky pointer). An always-on **status-line cue** reflects this
   same pointer — it names the attached workspace + time left and goes dark the moment you

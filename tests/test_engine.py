@@ -2110,4 +2110,164 @@ assert _statusline_with_stdin(
 print("[81] a legacy unscoped pointer is shown everywhere (until reconnect): OK")
 
 
+# 82. The engine is launched through a portable Python/sh polyglot shebang. A
+#     shell that runs the extensionless file directly -- POSIX kernels via the
+#     shebang, and Git Bash on Windows (where Claude Code's Bash tool runs the
+#     agent's `"${CLAUDE_PLUGIN_ROOT}/bin/runcode" ...` lines) -- must find a
+#     Python interpreter even when it's named `python` or `py` rather than
+#     `python3` (python.org's Windows build ships `python.exe`/`py.exe`, no
+#     `python3`). Driving the file with `sh` must therefore still run the program.
+_r82 = subprocess.run(["sh", ENGINE, "--help"], capture_output=True, text=True)
+assert _r82.returncode == 0, \
+    "sh-launched engine must run (rc=%d, err=%r)" % (_r82.returncode, _r82.stderr[:200])
+assert "usage" in _r82.stdout.lower() and "connect" in _r82.stdout, \
+    "sh-launched --help must print the program's usage"
+# The interpreter-discovery line tries all three common names, in POSIX order.
+_hdr82 = open(ENGINE, "r", encoding="utf-8").read(400)
+for _name in ("python3", "python", "py"):
+    assert _name in _hdr82, "polyglot shebang must try `%s`" % _name
+print("[82] portable polyglot shebang launches via sh + finds python/py: OK")
+
+# 83. The same header must remain valid Python (the polyglot line is a no-op
+#     string literal, not a syntax error), so `py -3 runcode` via the .cmd shim,
+#     the test loader, and a plain `import` all keep working. Compile the file.
+compile(open(ENGINE, "r", encoding="utf-8").read(), ENGINE, "exec")
+print("[83] engine header stays valid Python (compiles clean): OK")
+
+
+# 84. Raw byte transfers (the proxy SSH relay, `get` to stdout, a binary `write`
+#     from stdin) must run over BINARY stdio on Windows, or the C runtime's
+#     text-mode 0x0A<->0x0D0A translation (and 0x1A-as-EOF on input) silently
+#     corrupts them. _force_binary_stdio sets the given streams' fds to binary on
+#     Windows only, best-effort (a stream with no real fileno is skipped).
+class _FD84:
+    def __init__(self, fd, raise_=False):
+        self._fd, self._raise = fd, raise_
+    def fileno(self):
+        if self._raise:
+            raise OSError("no fileno")
+        return self._fd
+
+def _run_fb84(is_windows, streams):
+    setmodes = []
+    fake = types.ModuleType("msvcrt")
+    fake.setmode = lambda fd, mode: setmodes.append((fd, mode))
+    saved_mod = sys.modules.get("msvcrt")
+    saved_win = m._IS_WINDOWS
+    sys.modules["msvcrt"] = fake
+    m._IS_WINDOWS = is_windows
+    try:
+        m._force_binary_stdio(*streams)
+    finally:
+        m._IS_WINDOWS = saved_win
+        if saved_mod is None:
+            sys.modules.pop("msvcrt", None)
+        else:
+            sys.modules["msvcrt"] = saved_mod
+    return setmodes
+
+_OB = getattr(os, "O_BINARY", 0)
+assert sorted(_run_fb84(True, [_FD84(0), _FD84(1)])) == [(0, _OB), (1, _OB)], \
+    "must set each stream's fd to O_BINARY on Windows"
+assert _run_fb84(True, [_FD84(0), _FD84(9, raise_=True)]) == [(0, _OB)], \
+    "a stream without a fileno must be skipped, not crash"
+assert _run_fb84(False, [_FD84(0), _FD84(1)]) == [], \
+    "must be a no-op on POSIX"
+print("[84] _force_binary_stdio sets binary mode on Windows only: OK")
+
+# 85. The proxy relay shuttles raw SSH protocol bytes over stdio, so it must
+#     route through that binary-mode guard BEFORE relaying -- on both ends.
+import socket as _socket85
+
+class _FakeSock85:
+    def settimeout(self, *_a): pass
+    def recv(self, *_a): return b""        # immediate EOF -> reader thread exits
+    def sendall(self, *_a): pass
+    def shutdown(self, *_a): pass
+    def close(self): pass
+
+class _Std85:
+    def __init__(self): self.buffer = self
+    def read1(self, *_a): return b""       # immediate EOF -> writer loop exits
+    def read(self, *_a): return b""
+    def write(self, *_a): pass
+    def flush(self): pass
+
+_calls85 = []
+_saved_fb = m._force_binary_stdio
+_saved_cc = _socket85.create_connection
+_saved_io85 = (sys.stdin, sys.stdout)
+m._force_binary_stdio = lambda *streams: _calls85.append(tuple(streams))
+_socket85.create_connection = lambda *a, **k: _FakeSock85()
+_fin85, _fout85 = _Std85(), _Std85()
+sys.stdin, sys.stdout = _fin85, _fout85
+try:
+    m._relay_stdio("gw.example", 2222)
+finally:
+    sys.stdin, sys.stdout = _saved_io85
+    m._force_binary_stdio = _saved_fb
+    _socket85.create_connection = _saved_cc
+assert _calls85, "relay must call _force_binary_stdio before relaying bytes"
+assert _fin85 in _calls85[0] and _fout85 in _calls85[0], \
+    "relay must binary-guard both stdin and stdout"
+print("[85] proxy relay binary-guards stdio before piping SSH bytes: OK")
+
+
+# 86. `install-path` exposes the engine on the USER's own shell PATH. Claude Code
+#     auto-adds the plugin's bin/ to the AGENT's Bash tool, but NOT to the user's
+#     interactive terminal -- so the standalone `runcode ...` CLI the README
+#     documents needs this. On POSIX it symlinks the engine into ~/.local/bin;
+#     it's idempotent, and --remove takes the symlink back out.
+def _cap_stdout(fn):
+    buf = io.StringIO()
+    saved = sys.stdout
+    sys.stdout = buf
+    try:
+        fn()
+    finally:
+        sys.stdout = saved
+    return buf.getvalue()
+
+_home86 = tempfile.mkdtemp(prefix="rcssh-pathtest-")
+_saved_home86 = os.environ.get("HOME")
+_saved_win86 = m._IS_WINDOWS
+os.environ["HOME"] = _home86
+m._IS_WINDOWS = False
+_link86 = os.path.join(_home86, ".local", "bin", "runcode")
+try:
+    _cap_stdout(lambda: m.cmd_install_path(types.SimpleNamespace(remove=False)))
+    assert os.path.islink(_link86), "install-path must symlink into ~/.local/bin on POSIX"
+    assert os.path.realpath(_link86) == os.path.realpath(ENGINE), \
+        "the symlink must point at the engine"
+    # Idempotent: a second install leaves our link in place, doesn't error.
+    _cap_stdout(lambda: m.cmd_install_path(types.SimpleNamespace(remove=False)))
+    assert os.path.realpath(_link86) == os.path.realpath(ENGINE)
+    _cap_stdout(lambda: m.cmd_install_path(types.SimpleNamespace(remove=True)))
+    assert not os.path.lexists(_link86), "--remove must delete the symlink"
+finally:
+    m._IS_WINDOWS = _saved_win86
+    if _saved_home86 is None:
+        os.environ.pop("HOME", None)
+    else:
+        os.environ["HOME"] = _saved_home86
+print("[86] install-path symlinks the engine onto the user PATH (POSIX): OK")
+
+# 87. On Windows the runnable entry is runcode.cmd, so install-path prints the bin
+#     DIRECTORY to add to PATH (cmd resolves runcode.cmd there) plus the setx line
+#     -- and must NEVER create a symlink or edit the registry itself.
+_saved_win87 = m._IS_WINDOWS
+_saved_path87 = os.environ.get("PATH", "")
+m._IS_WINDOWS = True
+os.environ["PATH"] = os.pathsep.join(["/usr/bin", "/bin"])  # WITHOUT the bin dir
+try:
+    _out87 = _cap_stdout(lambda: m.cmd_install_path(types.SimpleNamespace(remove=False)))
+finally:
+    m._IS_WINDOWS = _saved_win87
+    os.environ["PATH"] = _saved_path87
+_bindir87 = os.path.dirname(os.path.realpath(ENGINE))
+assert _bindir87 in _out87, "Windows install-path must print the bin dir to add to PATH"
+assert "setx" in _out87.lower(), "Windows install-path must show how to persist PATH"
+print("[87] install-path prints a PATH instruction on Windows (no symlink): OK")
+
+
 print("\nALL PASS")
