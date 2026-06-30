@@ -1,7 +1,6 @@
 # RunCode CDE plugin — SSH for coding agents
 
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-![Python 3.8+](https://img.shields.io/badge/python-3.8%2B-blue.svg)
 ![Platforms: Windows · macOS · Linux](https://img.shields.io/badge/platform-Windows%20%C2%B7%20macOS%20%C2%B7%20Linux-lightgrey.svg)
 ![Dependencies: none](https://img.shields.io/badge/dependencies-none-brightgreen.svg)
 
@@ -29,8 +28,10 @@ cde-plugin/
 ├── .claude-plugin/
 │   ├── plugin.json              # plugin manifest (name: "runcode")
 │   └── marketplace.json         # lets the dir double as a one-plugin marketplace
-├── bin/runcode              # the engine — Python 3 stdlib, no deps (POSIX entry)
-├── bin/runcode.cmd          # Windows entry point (launches the engine via Python)
+├── bin/runcode              # launcher (POSIX) — fetches + sha256-verifies + caches the Go CLI
+├── bin/runcode.cmd          # Windows entry point → runcode.ps1
+├── bin/runcode.ps1          # launcher (Windows) — PowerShell mirror of bin/runcode
+├── bin/RUNCODE_VERSION      # pinned runcode-cli release tag the launchers fetch
 ├── commands/                    # Claude Code slash commands (all under /runcode:…)
 │   ├── connect.md               #   /runcode:connect [workspace] [command…]
 │   ├── stop.md                  #   /runcode:stop [workspace] (power the box down)
@@ -59,7 +60,7 @@ In Claude Code, plugin commands are namespaced under the plugin name, so typing
 | `/runcode:stop [workspace]` | stop a workspace on the control plane (VM powers down, compute billing pauses; storage persists). Defaults to the attached box and detaches it. Only on your explicit request |
 | `/runcode:disconnect` | detach from the workspace; work reverts to the local machine |
 | `/runcode:statusline` | wire the always-on "working-on: ws#" cue into your `settings.json` |
-| `/runcode:doctor` | preflight this machine — python, OpenSSH client, token, https base, reachability |
+| `/runcode:doctor` | preflight this machine — OpenSSH client, token, https base, reachability |
 | `/runcode:ssh` | the umbrella skill (also auto-activates when you ask in plain language) |
 
 You rarely need to type these — just ask Claude Code in plain language ("run the tests on my
@@ -136,8 +137,8 @@ by that bare name on every platform (on Windows it resolves to `runcode.cmd`). R
 **`/runcode:login`** once to authorize this machine (**`/runcode:doctor`** checks your setup).
 
 Want to run `runcode` yourself in your **own** terminal (the standalone CLI below)? That
-PATH injection is for the agent only, so do it once: **`runcode install-path`** (POSIX
-symlinks the engine into `~/.local/bin`; Windows prints the directory to add to `PATH`).
+PATH injection is for the agent only, so do it once: **`runcode install-path`** (puts
+`runcode` on your `PATH`).
 
 > **Hacking on the plugin itself?** Point Claude Code at a local checkout instead of the
 > marketplace — changes reload without a reinstall:
@@ -147,17 +148,23 @@ symlinks the engine into `~/.local/bin`; Windows prints the directory to add to 
 
 ### Platforms
 
-Runs on **Windows, macOS, and Linux** with the same engine (Python 3.8+ stdlib, no
-third-party packages). The two prerequisites are common to all three:
+Runs on **Windows, macOS, and Linux** as the same static **Go binary** — no language
+runtime to install. The plugin ships only a tiny launcher; on first use it downloads the
+matching `runcode` binary from the [runcode-cli release](https://github.com/runcode-io/runcode-cli/releases),
+verifies its sha256 against the release `checksums.txt`, and caches it under
+`~/.cache/runcode/bin/` (so every later call is instant and offline). Prerequisites:
 
-- **Python 3.8+** on `PATH` (on Windows the `py` launcher or `python`).
+- **First-run network** to GitHub Releases, plus `curl` (POSIX) or PowerShell (Windows,
+  built in) to fetch + verify the binary. Air-gapped, or pinning your own build? Set
+  `RUNCODE_BIN=/path/to/runcode` (or put a `runcode` from `brew install runcode-io/tap/runcode`
+  on `PATH`) and the launcher execs it directly — no download.
 - The **OpenSSH client** (`ssh` + `ssh-keygen`) on `PATH`. macOS and most Linux ship it;
   Windows 10/11 include it as an optional feature (*Settings → Apps → Optional features →
-  OpenSSH Client*) — the engine resolves `ssh.exe`/`ssh-keygen.exe` via `PATH`.
+  OpenSSH Client*) — the CLI resolves `ssh.exe`/`ssh-keygen.exe` via `PATH`.
 
-On Windows, `runcode` resolves to `bin/runcode.cmd`, which launches the engine with
-Python. Per-user state follows each platform's convention (an explicit `XDG_*` override
-always wins):
+On Windows, `runcode` resolves to `bin/runcode.cmd`, which runs `bin/runcode.ps1` (the
+PowerShell launcher). Per-user state follows each platform's convention (an explicit
+`XDG_*` override always wins):
 
 | | config (token) | cache (session keys/config) |
 |---|---|---|
@@ -198,7 +205,7 @@ The bundle API defaults to `https://app.runcode.io`; override with `RUNCODE_API_
 ## Usage (standalone, without the agent)
 
 ```bash
-runcode doctor                          # preflight: python, ssh, token, https base, reachability
+runcode doctor                          # preflight: ssh, token, https base, reachability
 runcode login                           # one-time: authorize via browser, save token
 runcode list                            # list your workspaces (running = SSH-connectable)
 runcode connect my-workspace            # mint a session + ATTACH the workspace
@@ -390,7 +397,7 @@ this command is locally authored).
 - **Short TTL** (default ~30 min, server-capped) and workspace-scoped.
 - Session material lives in `~/.cache/runcode/ws-<id>/` (dir `700`, files `600`;
   user-profile ACLs on Windows); `runcode clean` removes it.
-- **https-only control plane** — the engine refuses a non-`https` `--api-base`/`--web-base`
+- **https-only control plane** — the CLI refuses a non-`https` `--api-base`/`--web-base`
   (loopback `http` excepted for local dev), so the API token never rides over cleartext and
   the bundle that steers `ssh` can't be MITM'd into a downgrade. Refusal is `insecure_base`.
 - **Locally-built ssh config (no injectable surface)** — the plugin constructs the `ssh_config`
@@ -430,7 +437,7 @@ a plugin bug.
 
 ## Troubleshooting
 
-Run **`runcode doctor`** first — it checks Python, the OpenSSH client, your token, the
+Run **`runcode doctor`** first — it checks the OpenSSH client, your token, the
 base URL, and reachability in one shot (great on a fresh machine or a new OS).
 
 | Symptom | Cause / fix |
@@ -448,20 +455,26 @@ base URL, and reachability in one shot (great on a fresh machine or a new OS).
 
 ## Development
 
-The engine is a single Python 3.8+ stdlib script — **no build step, no dependencies, no
-virtualenv**. To hack on it, point Claude Code at a local checkout (changes reload with
-`/reload-plugins`, no reinstall):
+The CLI itself lives in its own repo — **[runcode-io/runcode-cli](https://github.com/runcode-io/runcode-cli)**
+(a static Go binary; build and test it there with `go test ./...`). This plugin ships only
+the small launcher in `bin/` that fetches + verifies + caches that binary. To hack on the
+plugin, point Claude Code at a local checkout (changes reload with `/reload-plugins`, no
+reinstall):
 
 ```bash
 claude --plugin-dir /path/to/cde-plugin
 ```
 
-Run the test suite (a self-contained script — no pytest, no network; it exercises the
-engine against monkeypatched seams):
+The launcher has its own offline test suite (self-contained sh — no network; it serves a
+fake release over `file://` and proves the verified-download, cache-reuse, checksum-mismatch
+abort, and `RUNCODE_BIN` override paths):
 
 ```bash
-python3 tests/test_engine.py        # prints "[N] …: OK" per case, ends "ALL PASS"
+sh tests/test_launcher.sh           # prints "ok - …" per case, ends "ALL PASS"
 ```
+
+Working against a local build of the CLI? `export RUNCODE_BIN=/path/to/runcode-cli/runcode`
+and the launcher execs it directly, skipping the download.
 
 A note on the threat model the code defends against: the SSH connection bundle from the
 backend is treated as **attacker-controllable** (a compromised or MITM'd control plane).
