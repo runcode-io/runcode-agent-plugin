@@ -24,7 +24,9 @@ writes/refreshes them.
    - git/scp/rsync: use `runcode.<name>:<path>` as the remote
 3. **It works even for a stopped box** — each host re-mints the short-lived key on connect
    via a `proxy` ProxyCommand, so the config never goes stale. But a *stopped* workspace
-   still can't accept connections: if the user points a tool at one and it fails, tell them
+   still can't accept connections (throwaway workspaces are listed only while running and
+   are dropped from the config when they end; they can't be started, so don't suggest
+   `--start` for them): if the user points a tool at one and it fails, tell them
    to start it first with `runcode connect <name> --start` (or `/runcode:connect <name>`),
    then reconnect. Re-run `config-ssh` after they create or rename workspaces.
 4. This is the **only** command that writes to `~/.ssh` — it's opt-in and reversible.
