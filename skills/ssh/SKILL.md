@@ -81,7 +81,10 @@ runcode list --json
 Use the numeric `id` when available; it works for personal, shared, and team
 workspaces. If exactly one workspace is connectable, use it. If several are
 available, show `id`, title, state, and ask which one to use. If a workspace is
-stopped but SSH-capable, `connect --start` can boot it.
+stopped but SSH-capable, `connect --start` can boot it. A throwaway workspace
+(`throwaway: true` in the JSON) is never stopped and can't be started: if it is
+`starting`, wait for it; if it has ended, it is gone with everything in it, so
+launch a new one (`connect --start` returns `throwaway_ended`).
 
 Connect and wait until SSH actually answers:
 
@@ -191,7 +194,19 @@ runcode stop [workspace id or name] --json
 ```
 
 With no argument, `stop` targets the attached workspace. Stopping powers down the
-VM on the control plane, compute billing pauses, and storage persists.
+VM on the control plane, compute billing pauses, and storage persists. That holds
+for regular workspaces only. A throwaway workspace cannot be stopped: `stop`
+returns `not_stoppable`. Throwaway workspaces end only with `runcode delete`, and
+everything in them is deleted. Explain that to the user and do not delete it
+yourself.
+
+## Delete
+
+`runcode delete <workspace> --yes` is irreversible. Never pass `--yes` unless the
+user has said an explicit yes in chat for that specific workspace. For a
+throwaway workspace, first show the user the warning ("This is a throwaway
+workspace: ending it deletes everything in it.") and wait for their yes. A
+general request to clean up, finish, or stop is not a yes to delete.
 
 ## Claude-Only Status Line
 
@@ -207,6 +222,11 @@ With `--json`, failures exit non-zero and print
 - `no_token` or `unauthorized`: run `runcode login`, then retry once.
 - `start_failed`: relay the message and stop.
 - `stop_failed`: relay the message and stop.
+- `not_stoppable`: the workspace is a throwaway one; it ends only with
+  `runcode delete` (needs the user's explicit yes, see Delete) and everything in
+  it is deleted. Relay that and stop.
+- `throwaway_ended`: the throwaway workspace has ended and its contents are
+  gone; it can't be started. Offer to launch a new one.
 - `not_ready`: the workspace did not answer in time; retry once with a longer
   timeout only if useful.
 - `conflict`: workspace is not SSH-capable or cannot be reached; surface it.

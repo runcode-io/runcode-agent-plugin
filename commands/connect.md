@@ -25,6 +25,9 @@ tokens** as a command to run on it (optional).
 2. Establish a session — start the box if needed and wait until it actually answers:
    `runcode connect "<workspace>" --start --wait --json`, then read `config` and
    `alias` from the JSON (`started: true` means it was stopped and you started it).
+   - A **throwaway** workspace is never booted by `--start`: it waits for one that is
+     still starting, and returns `throwaway_ended` for one that has ended (contents gone;
+     launch a new one instead).
    - `--start` boots a stopped workspace and waits for *running*; `--wait` then blocks
      until SSH is truly reachable (a freshly-started box can lag ~30s). Drop `--start`/
      `--wait` only when you already know it's up and answering.

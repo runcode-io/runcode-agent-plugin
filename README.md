@@ -57,7 +57,7 @@ In Claude Code, plugin commands are namespaced under the plugin name, so typing
 | `/runcode:context [workspace]` | one-shot workspace digest (cwd, git, project, tool versions) so the agent orients without probing the box piecemeal |
 | `/runcode:forward <port>` | expose a workspace port locally (e.g. open a dev server in your browser) |
 | `/runcode:config-ssh` | write `~/.ssh/config` host entries so VS Code Remote / JetBrains / git / scp reach your workspaces as `runcode.<name>` |
-| `/runcode:stop [workspace]` | stop a workspace on the control plane (VM powers down, compute billing pauses; storage persists). Defaults to the attached box and detaches it. Only on your explicit request |
+| `/runcode:stop [workspace]` | stop a workspace on the control plane (VM powers down, compute billing pauses; storage persists; not for throwaway workspaces, which end only with `delete`). Defaults to the attached box and detaches it. Only on your explicit request |
 | `/runcode:disconnect` | detach from the workspace; work reverts to the local machine |
 | `/runcode:statusline` | wire the always-on "working-on: ws#" cue into your `settings.json` |
 | `/runcode:doctor` | preflight this machine — OpenSSH client, token, https base, reachability |
@@ -254,7 +254,10 @@ sticky attachment and cached session but leaves the workspace **running** (and s
 billing compute). `stop` powers the **VM down** on the control plane (compute billing
 pauses; storage persists), and because a stopped box can't serve `exec`, stopping the
 attached box also detaches it. Run `stop` only when the user explicitly asks to shut the
-box down; `connect --start` boots it again later.
+box down; `connect --start` boots it again later. **Throwaway workspaces** are the exception:
+they can't be stopped (`stop` returns `not_stoppable`) or started again; they end only with
+`runcode delete`, which deletes everything in them. An agent must never pass `--yes` to
+`delete` without the user's explicit yes in chat for that workspace.
 
 ### Sticky session: work happens on the workspace
 
@@ -447,6 +450,8 @@ base URL, and reachability in one shot (great on a fresh machine or a new OS).
 | `login timed out … no callback` | Browser never reached the `127.0.0.1` listener (e.g. logging in on a remote box) — use `runcode login --paste`. |
 | `404 Workspace not found` | Token's user isn't authorized for that workspace, or wrong name/id. |
 | `409 … must be running` / not SSH-capable | Pass `connect --start` to boot a stopped box; if it persists, it's one SSH can't reach. |
+| `not_stoppable` | The workspace is a throwaway one: it can't be stopped; `runcode delete` ends it and deletes everything in it (needs your explicit yes). |
+| `throwaway_ended` | The throwaway workspace has ended and is gone with everything in it; launch a new one. |
 | `not_ready` after `--start`/`--wait` | Box didn't come up / answer in time — retry, or raise `--timeout`. |
 | `ssh-keygen not found` / `ssh not found` | Install the OpenSSH client (on Windows: *Optional features → OpenSSH Client*). |
 | `insecure_base` / refusing an insecure … | `--api-base`/`--web-base` (or `RUNCODE_API_BASE`/`RUNCODE_WEB_BASE`) is `http://` to a non-loopback host. Use `https://`. |
